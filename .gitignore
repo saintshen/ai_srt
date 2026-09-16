@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local media and generated subtitles
+/video/
+/*.srt
+
+# Tooling
+.crush/
+.grok/
+
+# whisper.cpp generated build tree and downloaded weights
+whisper.cpp/build/
+whisper.cpp/build.log
+whisper.cpp/models/ggml-*.bin
