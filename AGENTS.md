@@ -1,7 +1,9 @@
 # ai_srt
 
 A personal offline subtitle generator: local `whisper.cpp` (Vulkan backend)
-does speech recognition, local Ollama translates when asked. `whisper.cpp/`
+does speech recognition (default `large-v3-turbo`), optional SenseVoice
+(FunASR, via Voxtype ONNX) for Japanese / zh/en/ja/ko/yue, and local Ollama
+translates when asked. `whisper.cpp/`
 is a vendored upstream clone (has its own build system and its own
 `AGENTS.md` contribution policy — that policy is for upstream PRs, not
 relevant here since we only consume its prebuilt binary).
@@ -40,7 +42,8 @@ python3 gen_srt.py /path/to/video.mp4 --from ja
 python3 gen_srt.py /path/to/video.mp4 --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
-python3 gen_srt.py /path/to/video.mp4 --model large-v3
+python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+python3 gen_srt.py /path/to/video.mp4 --model small
 python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
 python3 gen_srt.py /path/to/video.mp4 --engine trans --to zh   # translate-shell/Google (sends text online)
 python3 gen_srt.py --list-langs
@@ -51,6 +54,15 @@ python3 gen_srt.py --help
 Output is written next to the input: `video.<src>.srt` (transcribe) or
 `video.<tgt>.srt` (translate). Whisper models auto-download to
 `whisper.cpp/models/ggml-<size>.bin` on first use of a given `--model` size.
+If `~/.local/share/voxtype/models/ggml-large-v3-turbo.bin` already exists,
+`--model large-v3-turbo` symlinks that file instead of downloading again.
+
+`--asr sensevoice` is for Japanese (also zh/en/ko/yue). It does **not** use
+the Vulkan `voxtype` binary (that build has no SenseVoice). It calls
+`/usr/lib/voxtype/voxtype-onnx-avx512` (fallback: `voxtype-onnx-avx2`) on
+Silero VAD clips so the SRT still has timestamps. VAD for this path must
+run on CPU: `whisper-vad-speech-segments --use-gpu` aborts on this AMD
+Vulkan setup.
 
 There is no test suite for the top-level script. `whisper.cpp/tests/`
 (`tests/run-tests.sh`) covers the vendored engine, not this repo's code.
@@ -71,6 +83,9 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   that (`stream: false`, explicit `keep_alive`).
 - Default Ollama model: `qwen3.5` for every language pair. Override with
   `--ollama-model`.
+- Default Whisper model: `large-v3-turbo`. ASR backend is `--asr whisper`
+  (default) or `--asr sensevoice`. `--engine` remains the *translation*
+  engine (`ollama` / `trans`).
 
 ## Pitfalls
 
@@ -94,3 +109,7 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   (qwen3.5, deepseek-r1, gpt-oss) otherwise spend the token budget on a
   hidden chain-of-thought and often return an empty translation. If an old
   Ollama rejects the field with HTTP 400, the call retries without it.
+- Do not call `whisper-vad-speech-segments --use-gpu` on this AMD Vulkan
+  setup; it aborts. The SenseVoice path always runs that helper on CPU.
+- `/usr/bin/voxtype` is the Vulkan build and cannot run SenseVoice. The
+  SenseVoice path must use `voxtype-onnx-avx512` (or `voxtype-onnx-avx2`).

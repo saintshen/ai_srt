@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Generate subtitles from video or audio: local whisper.cpp (Vulkan GPU) for
-speech recognition, optional local Ollama or translate-shell for translation.
+speech recognition (default model large-v3-turbo), optional SenseVoice
+(FunASR, via Voxtype ONNX) for Japanese sources, and optional local Ollama
+or translate-shell for translation.
 
 Any ffmpeg-readable file works. Default is transcribe-only (no translation);
 Whisper auto-detects the source language, override with --from. Pass --to to
-translate.
+translate. For Japanese video, --asr sensevoice uses SenseVoice Small.
 
 Translation engines (--engine):
     ollama (default): fully offline, qwen3.5 with a generic translation prompt.
@@ -18,7 +20,8 @@ Usage:
     python3 gen_srt.py /path/to/video.mp4 --to zh
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
-    python3 gen_srt.py /path/to/video.mp4 --model large-v3
+    python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+    python3 gen_srt.py /path/to/video.mp4 --model small
     python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
     python3 gen_srt.py /path/to/video.mp4 --engine trans --to zh
     python3 gen_srt.py --list-langs
@@ -43,10 +46,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WHISPER_CPP_DIR = ROOT / "whisper.cpp"
 WHISPER_CLI = WHISPER_CPP_DIR / "build" / "bin" / "whisper-cli"
+WHISPER_VAD_CLI = WHISPER_CPP_DIR / "build" / "bin" / "whisper-vad-speech-segments"
 MODELS_DIR = WHISPER_CPP_DIR / "models"
 VAD_MODEL = MODELS_DIR / "ggml-silero-v6.2.0.bin"
+VOXTYPE_TURBO = Path.home() / ".local/share/voxtype/models/ggml-large-v3-turbo.bin"
+VOXTYPE_LIB = Path("/usr/lib/voxtype")
 
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
+DEFAULT_VAD_MAX_SPEECH_S = 8.0
+SENSEVOICE_LANGS = {"zh", "en", "ja", "ko", "yue"}
 
 # whisper.cpp language codes → English names (aligned with src/whisper.cpp g_lang)
 WHISPER_LANGS = {
@@ -112,6 +121,11 @@ SRT_BLOCK_RE = re.compile(
     r"\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s*(.*)"
 )
 MUSIC_PLACEHOLDER_RE = re.compile(r"^[\(（][^)）]*[\)）]$|^[♪\s]+$")
+VAD_SEGMENT_RE = re.compile(
+    r"Speech segment\s+\d+:\s+start\s*=\s*([0-9.]+),\s*end\s*=\s*([0-9.]+)"
+)
+SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
+SENSEVOICE_LANG_TAG_RE = re.compile(r"<\|(zh|en|ja|ko|yue)\|>")
 
 
 def lang_display(code: str) -> str:
@@ -256,6 +270,13 @@ def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
         ) from e
 
 
+def whisper_env() -> dict:
+    env = os.environ.copy()
+    lib_dir = str(WHISPER_CPP_DIR / "build" / "bin")
+    env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+    return env
+
+
 def extract_audio(media_path: Path, wav_path: Path, stage: str):
     cmd = [
         "ffmpeg", "-y", "-i", str(media_path),
@@ -271,12 +292,20 @@ def extract_audio(media_path: Path, wav_path: Path, stage: str):
 
 def ensure_model(model_size: str) -> Path:
     model_path = MODELS_DIR / f"ggml-{model_size}.bin"
-    if not model_path.exists():
-        print(f"    downloading Whisper model {model_size} ...")
-        subprocess.run(
-            ["bash", str(WHISPER_CPP_DIR / "models" / "download-ggml-model.sh"), model_size],
-            check=True, cwd=WHISPER_CPP_DIR,
-        )
+    if model_path.exists():
+        return model_path
+    if model_size == "large-v3-turbo" and VOXTYPE_TURBO.is_file():
+        try:
+            model_path.symlink_to(VOXTYPE_TURBO)
+            print(f"    linked Whisper {model_size} from {VOXTYPE_TURBO}")
+            return model_path
+        except OSError as e:
+            print(f"    could not link Voxtype {model_size} ({e}); downloading...")
+    print(f"    downloading Whisper model {model_size} ...")
+    subprocess.run(
+        ["bash", str(WHISPER_CPP_DIR / "models" / "download-ggml-model.sh"), model_size],
+        check=True, cwd=WHISPER_CPP_DIR,
+    )
     return model_path
 
 
@@ -287,6 +316,7 @@ def ts_to_seconds(h, m, s, ms):
 def transcribe(wav_path: Path, model_path: Path, language: str,
                use_vad: bool = True, suppress_music: bool = True,
                vad_threshold: float = 0.5, vad_min_silence_ms: int = 100,
+               vad_max_speech_s: float = DEFAULT_VAD_MAX_SPEECH_S,
                stage: str = "[2/3]"):
     if language == "auto":
         print(f"{stage} transcribing with whisper-cli (Vulkan GPU), auto-detecting language...")
@@ -304,9 +334,11 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
             "--vad", "-vm", str(VAD_MODEL),
             "-vt", str(vad_threshold),
             "-vsd", str(vad_min_silence_ms),
+            "-vmsd", str(vad_max_speech_s),
         ]
         print(f"    VAD enabled, skipping non-speech "
-              f"(threshold={vad_threshold}, min silence={vad_min_silence_ms}ms)")
+              f"(threshold={vad_threshold}, min silence={vad_min_silence_ms}ms, "
+              f"max speech={vad_max_speech_s}s)")
     elif use_vad:
         print(f"    warning: VAD model missing ({VAD_MODEL}), processing full audio")
     if suppress_music:
@@ -317,9 +349,7 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
             "--suppress-regex", r"[\(（][^)）]*[\)）]|♪+",
         ]
         print("    non-speech placeholder suppression enabled (e.g. (音楽)/(拍手)/(music))")
-    env = os.environ.copy()
-    lib_dir = str(WHISPER_CPP_DIR / "build" / "bin")
-    env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+    env = whisper_env()
     # Capture raw bytes and decode loosely: whisper-cli stderr/progress can
     # contain non-UTF-8 bytes (progress bars, terminal control chars) that
     # would crash with text=True.
@@ -355,6 +385,173 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
                 continue
             segments.append((start, end, text))
     extra = f" (filtered {skipped} non-speech placeholders)" if skipped else ""
+    print(f"    {len(segments)} segments{extra}")
+    return segments, detected
+
+
+def wav_duration_seconds(wav_path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            str(wav_path),
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        sys.exit(f"ffprobe failed:\n{result.stderr.strip()[-2000:]}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        sys.exit(f"ffprobe returned no duration for {wav_path}")
+
+
+def find_sensevoice_bin() -> Path:
+    for name in ("voxtype-onnx-avx512", "voxtype-onnx-avx2"):
+        candidate = VOXTYPE_LIB / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    sys.exit(
+        "SenseVoice needs a Voxtype ONNX binary (voxtype-onnx-avx512 or "
+        "voxtype-onnx-avx2) under /usr/lib/voxtype. The default Vulkan "
+        "voxtype binary is not compiled with SenseVoice."
+    )
+
+
+def strip_sensevoice_text(text: str) -> str:
+    return SENSEVOICE_TAG_RE.sub("", text).strip()
+
+
+def parse_voxtype_transcript(stdout: str) -> str:
+    lines = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(("Loading audio", "Audio format", "Processing ")):
+            continue
+        if " INFO " in s or " WARN " in s or " ERROR " in s or " DEBUG " in s:
+            continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}T", s):
+            continue
+        lines.append(s)
+    return " ".join(lines).strip()
+
+
+def vad_speech_segments(wav_path: Path, vad_threshold: float,
+                        vad_min_silence_ms: int, vad_max_speech_s: float):
+    """Return [(start_s, end_s), ...]. Standalone VAD must run on CPU; --use-gpu
+    aborts on this machine's Vulkan backend."""
+    if not WHISPER_VAD_CLI.is_file():
+        sys.exit(f"VAD helper missing: {WHISPER_VAD_CLI}")
+    if not VAD_MODEL.exists():
+        sys.exit(f"VAD model missing: {VAD_MODEL}")
+    cmd = [
+        str(WHISPER_VAD_CLI),
+        "--file", str(wav_path),
+        "--vad-model", str(VAD_MODEL),
+        "--vad-threshold", str(vad_threshold),
+        "--vad-min-silence-duration-ms", str(vad_min_silence_ms),
+        "--vad-max-speech-duration-s", str(vad_max_speech_s),
+        "--no-prints",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=False, env=whisper_env())
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        sys.exit(f"whisper-vad-speech-segments failed:\n{stderr[-2000:]}")
+    spans = []
+    for m in VAD_SEGMENT_RE.finditer(stdout):
+        # Tool prints centiseconds (start = 32.00 → 0.32s).
+        start = float(m.group(1)) / 100.0
+        end = float(m.group(2)) / 100.0
+        if end - start >= 0.15:
+            spans.append((start, end))
+    return spans
+
+
+def extract_wav_clip(src_wav: Path, dst_wav: Path, start: float, end: float):
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src_wav),
+        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-ar", "16000", "-ac", "1",
+        str(dst_wav),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        sys.exit(f"ffmpeg clip failed:\n{err[-2000:]}")
+
+
+def transcribe_sensevoice_clip(bin_path: Path, wav_path: Path, language: str):
+    cmd = [str(bin_path)]
+    if language in SENSEVOICE_LANGS:
+        cmd += ["--language", language]
+    cmd += ["transcribe", "--engine", "sensevoice", str(wav_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout).strip()
+        sys.exit(f"SenseVoice (Voxtype ONNX) failed:\n{err[-2000:]}")
+    raw = parse_voxtype_transcript(result.stdout + "\n" + result.stderr)
+    return strip_sensevoice_text(raw), raw
+
+
+def transcribe_sensevoice(wav_path: Path, language: str, tmp_dir: Path,
+                          use_vad: bool = True, suppress_music: bool = True,
+                          vad_threshold: float = 0.5, vad_min_silence_ms: int = 100,
+                          vad_max_speech_s: float = DEFAULT_VAD_MAX_SPEECH_S,
+                          stage: str = "[2/3]"):
+    """SenseVoice Small (FunASR) via Voxtype ONNX. Silero VAD supplies SRT times."""
+    bin_path = find_sensevoice_bin()
+    sv_lang = language if language in SENSEVOICE_LANGS else "auto"
+    print(f"{stage} transcribing with SenseVoice Small (Voxtype ONNX, CPU) "
+          f"language={sv_lang}...")
+    print(f"    binary: {bin_path}")
+    if language not in ("auto", "unk") and language not in SENSEVOICE_LANGS:
+        print(f"    warning: SenseVoice covers zh/en/ja/ko/yue; "
+              f"'{language}' will use auto")
+        sv_lang = "auto"
+
+    if use_vad:
+        spans = vad_speech_segments(
+            wav_path, vad_threshold, vad_min_silence_ms, vad_max_speech_s,
+        )
+        print(f"    VAD (CPU) found {len(spans)} speech spans "
+              f"(threshold={vad_threshold}, min silence={vad_min_silence_ms}ms, "
+              f"max speech={vad_max_speech_s}s)")
+    else:
+        spans = [(0.0, wav_duration_seconds(wav_path))]
+        print("    VAD disabled; transcribing the full file as one cue")
+
+    if not spans:
+        print("    no speech detected")
+        detected = language if language != "auto" else "unk"
+        return [], detected
+
+    detected = language if language != "auto" else "unk"
+    segments = []
+    skipped = 0
+    clip_dir = tmp_dir / "sv_clips"
+    clip_dir.mkdir(exist_ok=True)
+    for i, (start, end) in enumerate(spans):
+        clip = clip_dir / f"{i:04d}.wav"
+        extract_wav_clip(wav_path, clip, start, end)
+        text, raw = transcribe_sensevoice_clip(bin_path, clip, sv_lang)
+        if language == "auto" and detected == "unk":
+            m = SENSEVOICE_LANG_TAG_RE.search(raw)
+            if m:
+                detected = m.group(1)
+                print(f"    detected source language: {detected} ({lang_display(detected)})")
+        if not text:
+            skipped += 1
+            continue
+        if suppress_music and MUSIC_PLACEHOLDER_RE.match(text):
+            skipped += 1
+            continue
+        segments.append((start, end, text))
+        print(f"    [{i+1}/{len(spans)}] {start:.1f}-{end:.1f}s: {len(text)} chars")
+    extra = f" (skipped {skipped})" if skipped else ""
     print(f"    {len(segments)} segments{extra}")
     return segments, detected
 
@@ -421,7 +618,8 @@ def list_langs():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Generate subtitles from video or audio (local Whisper, optional translation)",
+        description="Generate subtitles from video or audio "
+                    "(local Whisper or SenseVoice, optional translation)",
     )
     ap.add_argument("media", type=Path, nargs="?",
                     help="video or audio file (anything ffmpeg can read)")
@@ -431,9 +629,14 @@ def main():
     ap.add_argument("--to", dest="tgt_lang", default=None, metavar="LANG",
                     type=lambda s: normalize_lang(s, allow_auto=False),
                     help="target language. Omit to transcribe only. Common: zh/en/ja")
-    ap.add_argument("--model", default="small",
-                    help="Whisper ASR model: tiny/base/small/medium/large-v3 "
-                         "(not the translator; see --ollama-model)")
+    ap.add_argument("--asr", choices=["whisper", "sensevoice"], default="whisper",
+                    help="speech recognition: whisper=whisper.cpp Vulkan (default), "
+                         "sensevoice=SenseVoice Small via Voxtype ONNX (Japanese / "
+                         "zh/en/ja/ko/yue, CPU)")
+    ap.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
+                    help="Whisper ASR model: tiny/base/small/medium/large-v3/"
+                         "large-v3-turbo (default large-v3-turbo; ignored with "
+                         "--asr sensevoice). Not the translator; see --ollama-model")
     ap.add_argument("--ollama-model", default=None, metavar="NAME",
                     help="Ollama translation model, default qwen3.5. "
                          "See --list-models for locally installed models")
@@ -450,6 +653,9 @@ def main():
                          "Lower (e.g. 0.3) catches more weak speech, with more false positives")
     ap.add_argument("--vad-min-silence", type=int, default=100,
                     help="VAD minimum silence in ms, default 100, used to split segments")
+    ap.add_argument("--vad-max-speech", type=float, default=DEFAULT_VAD_MAX_SPEECH_S,
+                    help="VAD max speech span in seconds, default 8, splits long "
+                         "talk into shorter subtitle cues")
     ap.add_argument("--no-suppress-music", action="store_true",
                     help="keep non-speech placeholders such as (音楽)/(拍手)/(music)")
     ap.add_argument("--engine", choices=["ollama", "trans"], default="ollama",
@@ -478,20 +684,31 @@ def main():
     do_translate = args.tgt_lang is not None
     n_stages = 3 if do_translate else 2
 
-    model_path = ensure_model(args.model)
+    model_path = None
+    if args.asr == "whisper":
+        model_path = ensure_model(args.model)
 
     with tempfile.TemporaryDirectory() as td:
-        wav_path = Path(td) / "audio.wav"
+        tmp_dir = Path(td)
+        wav_path = tmp_dir / "audio.wav"
         extract_audio(media_path, wav_path, stage=f"[1/{n_stages}]")
-        segments, detected_lang = transcribe(
-            wav_path, model_path,
+        asr_kwargs = dict(
             language=args.src_lang,
             use_vad=not args.no_vad,
             suppress_music=not args.no_suppress_music,
             vad_threshold=args.vad_threshold,
             vad_min_silence_ms=args.vad_min_silence,
+            vad_max_speech_s=args.vad_max_speech,
             stage=f"[2/{n_stages}]",
         )
+        if args.asr == "sensevoice":
+            segments, detected_lang = transcribe_sensevoice(
+                wav_path, tmp_dir=tmp_dir, **asr_kwargs,
+            )
+        else:
+            segments, detected_lang = transcribe(
+                wav_path, model_path, **asr_kwargs,
+            )
         src_lang = detected_lang if args.src_lang == "auto" else args.src_lang
         actually_translate = do_translate and src_lang != args.tgt_lang
         if do_translate and not actually_translate:

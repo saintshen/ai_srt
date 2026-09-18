@@ -2,11 +2,11 @@
 
 [English](README.md) | 中文
 
-本地离线字幕生成：用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（Vulkan GPU）识别语音，需要翻译时再调用本机 [Ollama](https://ollama.com/)。
+本地离线字幕生成：用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（Vulkan GPU）识别语音（默认 `large-v3-turbo`），日语等片源可选用 [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)（经 Voxtype 的 ONNX 构建），需要翻译时再调用本机 [Ollama](https://ollama.com/)。
 
 默认只识别、不翻译，源语言由 Whisper 自动检测。加上 `--to` 才会翻译。翻译默认完全离线（`qwen3.5`）；`--engine trans` 会走 Google，文本会上网。
 
-顶层脚本是纯 Python 3 标准库，不用 `pip install`。
+顶层脚本是纯 Python 3 标准库，不用 `pip install`。SenseVoice 使用本机已有的 `voxtype-onnx-avx512`。
 
 ## 依赖
 
@@ -25,7 +25,7 @@ cmake --build build -j
 ollama pull qwen3.5
 ```
 
-Whisper 权重会在首次使用对应 `--model` 时自动下载到 `whisper.cpp/models/`。
+Whisper 权重会在首次使用对应 `--model` 时自动下载到 `whisper.cpp/models/`。若 Voxtype 已有 `ggml-large-v3-turbo.bin`，脚本会直接链接过去，不再下第二份。
 
 ## 用法
 
@@ -36,12 +36,15 @@ python3 gen_srt.py /path/to/video.mp4
 # 指定源语言
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
+# 日语用 SenseVoice（FunASR 模型，Voxtype ONNX + Silero VAD 时间轴）
+python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+
 # 翻译成中文（默认双语：译文 + 原文）
 python3 gen_srt.py /path/to/video.mp4 --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
 
 # 换识别模型 / 翻译模型
-python3 gen_srt.py /path/to/video.mp4 --model large-v3
+python3 gen_srt.py /path/to/video.mp4 --model small
 python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
 
 # 用 translate-shell / Google（联网）

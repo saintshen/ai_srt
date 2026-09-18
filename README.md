@@ -2,11 +2,11 @@
 
 English | [中文](README.zh.md)
 
-Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (Vulkan GPU) for speech recognition, optional local [Ollama](https://ollama.com/) for translation.
+Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (Vulkan GPU) for speech recognition (default `large-v3-turbo`), optional [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) for Japanese (and zh/en/ko/yue) via Voxtype's ONNX build, and optional local [Ollama](https://ollama.com/) for translation.
 
 Default is transcribe-only. Whisper auto-detects the source language. Pass `--to` to translate. Translation is offline by default (`qwen3.5`); `--engine trans` uses Google and sends text over the network.
 
-The top-level script is Python 3 stdlib only — no `pip install`.
+The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice reuses a Voxtype ONNX binary already on the machine (`voxtype-onnx-avx512`).
 
 ## Requirements
 
@@ -25,7 +25,7 @@ cmake --build build -j
 ollama pull qwen3.5
 ```
 
-Whisper weights download automatically to `whisper.cpp/models/` on first use of a given `--model` size.
+Whisper weights download automatically to `whisper.cpp/models/` on first use of a given `--model` size. If Voxtype already has `ggml-large-v3-turbo.bin`, the script links that copy instead of downloading again.
 
 ## Usage
 
@@ -36,12 +36,15 @@ python3 gen_srt.py /path/to/video.mp4
 # pin the source language
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
+# Japanese via SenseVoice (FunASR model, Voxtype ONNX + Silero VAD timestamps)
+python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+
 # translate to Chinese (bilingual by default: translation + original)
 python3 gen_srt.py /path/to/video.mp4 --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
 
 # swap ASR / translation models
-python3 gen_srt.py /path/to/video.mp4 --model large-v3
+python3 gen_srt.py /path/to/video.mp4 --model small
 python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
 
 # translate-shell / Google (online)
