@@ -7,8 +7,7 @@ translate-shell 翻译，写出 .srt。
 自动检测，可用 --from 指定。加 --to 才翻译。
 
 翻译引擎 (--engine)：
-    ollama (默认): 完全本地离线。ja→zh 默认用 trans-ja 模型，其他语言对
-        用 qwen2.5:7b + 通用翻译提示词。
+    ollama (默认): 完全本地离线，默认用 qwen3.5 + 通用翻译提示词。
     trans: 调用 translate-shell (trans 命令) 走 Google 翻译 API
         （文本会发送到 Google，非离线）。
 
@@ -19,8 +18,10 @@ translate-shell 翻译，写出 .srt。
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
     python3 gen_srt.py /path/to/video.mp4 --model large-v3
+    python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
     python3 gen_srt.py /path/to/video.mp4 --engine trans --to zh
     python3 gen_srt.py --list-langs
+    python3 gen_srt.py --list-models
     python3 gen_srt.py --help
 
 输出:
@@ -34,6 +35,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -43,8 +45,7 @@ WHISPER_CLI = WHISPER_CPP_DIR / "build" / "bin" / "whisper-cli"
 MODELS_DIR = WHISPER_CPP_DIR / "models"
 VAD_MODEL = MODELS_DIR / "ggml-silero-v6.2.0.bin"
 
-DEFAULT_JA_ZH_MODEL = "trans-ja"
-DEFAULT_GENERIC_MODEL = "qwen2.5:7b"
+DEFAULT_OLLAMA_MODEL = "qwen3.5"
 
 # whisper.cpp 支持的语言代码 → 英文名（与 src/whisper.cpp g_lang 对齐）
 WHISPER_LANGS = {
@@ -151,10 +152,106 @@ def trans_code(code: str) -> str:
     return TRANS_CODES.get(code, code)
 
 
-def default_ollama_model(src: str, tgt: str) -> str:
-    if src == "ja" and tgt == "zh":
-        return DEFAULT_JA_ZH_MODEL
-    return DEFAULT_GENERIC_MODEL
+def ollama_base_url(ollama_url: str) -> str:
+    url = ollama_url.rstrip("/")
+    if url.endswith("/api/generate"):
+        url = url[: -len("/api/generate")]
+    return url
+
+
+def list_ollama_models(ollama_url: str = "http://localhost:11434/api/generate"):
+    """返回 [(name, details, size), ...]，连不上 Ollama 则直接退出。"""
+    tags_url = ollama_base_url(ollama_url) + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=10) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        sys.exit(f"无法连接 Ollama ({tags_url}): {e}")
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name") or ""
+        if name:
+            models.append((name, m.get("details") or {}, m.get("size") or 0))
+    models.sort(key=lambda x: x[0])
+    return models
+
+
+def print_ollama_models():
+    models = list_ollama_models()
+    if not models:
+        print("本机没有已安装的 Ollama 模型。用 ollama pull <name> 下载。")
+        return
+    print(f"{'模型':<24} {'参数量':<10} 大小")
+    for name, details, size in models:
+        params = details.get("parameter_size") or ""
+        size_gb = f"{size / 1e9:.1f} GB" if size else ""
+        print(f"{name:<24} {params:<10} {size_gb}")
+    print()
+    print("用法: python3 gen_srt.py video.mp4 --to zh --ollama-model <模型名>")
+    print(f"默认: {DEFAULT_OLLAMA_MODEL}")
+
+
+def ollama_model_installed(name: str, installed: list) -> bool:
+    wanted = {name, f"{name}:latest"}
+    if name.endswith(":latest"):
+        wanted.add(name[:-len(":latest")])
+    have = set()
+    for inst in installed:
+        have.add(inst)
+        if inst.endswith(":latest"):
+            have.add(inst[:-len(":latest")])
+    return bool(wanted & have)
+
+
+def ensure_ollama_model(name: str):
+    installed = [m[0] for m in list_ollama_models()]
+    if ollama_model_installed(name, installed):
+        return
+    listing = "\n".join(f"    {n}" for n in installed) or "    (无)"
+    sys.exit(
+        f"Ollama 模型不存在: {name}\n本机已安装:\n{listing}\n"
+        f"查看: python3 gen_srt.py --list-models\n"
+        f"下载: ollama pull {name}"
+    )
+
+
+def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
+                    ollama_url: str = "http://localhost:11434/api/generate",
+                    options=None, timeout: int = 180) -> dict:
+    """调用 /api/generate。默认关闭 think，避免推理模型把额度耗在思考上、译文为空。"""
+    payload = {
+        "model": ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": keep_alive,
+        "think": False,
+    }
+    if options:
+        payload["options"] = options
+
+    def _post(body: dict):
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            ollama_url, data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+
+    try:
+        return _post(payload)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        # 旧版 Ollama / 不认识 think 字段的模型会 400，去掉后再试一次
+        if e.code == 400 and "think" in payload:
+            payload.pop("think", None)
+            try:
+                return _post(payload)
+            except urllib.error.HTTPError as e2:
+                err_body = e2.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Ollama 请求失败 HTTP {e2.code}: {err_body[:500]}"
+                ) from e2
+        raise RuntimeError(f"Ollama 请求失败 HTTP {e.code}: {err_body[:500]}") from e
 
 
 def extract_audio(media_path: Path, wav_path: Path, stage: str):
@@ -262,17 +359,7 @@ def warmup_ollama(ollama_model: str, keep_alive: str = "10m",
                   ollama_url: str = "http://localhost:11434/api/generate"):
     """提前把模型加载进显存并设置保留时间，避免翻译时中途卸载重载。"""
     print(f"    预热 Ollama 模型 {ollama_model} (keep_alive={keep_alive}) ...")
-    payload = json.dumps({
-        "model": ollama_model,
-        "prompt": "你好",
-        "stream": False,
-        "keep_alive": keep_alive,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        ollama_url, data=payload, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        json.load(resp)
+    ollama_generate(ollama_model, "你好", keep_alive=keep_alive, ollama_url=ollama_url)
     print("    预热完成，模型已常驻显存")
 
 
@@ -285,19 +372,11 @@ def translate_ollama(text: str, src: str, tgt: str, ollama_model: str,
         f"请将下面的{src_name}翻译成{tgt_name}，只输出译文本身，"
         f"不要添加任何解释、拼音、罗马音或引号：\n{text}"
     )
-    payload = json.dumps({
-        "model": ollama_model,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": keep_alive,
-        "options": {"temperature": 0.2},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        ollama_url, data=payload, headers={"Content-Type": "application/json"}
+    data = ollama_generate(
+        ollama_model, prompt, keep_alive=keep_alive, ollama_url=ollama_url,
+        options={"temperature": 0.2, "presence_penalty": 0},
     )
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        data = json.load(resp)
-    return data["response"].strip()
+    return (data.get("response") or "").strip()
 
 
 def translate_trans(text: str, src: str, tgt: str) -> str:
@@ -349,9 +428,11 @@ def main():
                     type=lambda s: normalize_lang(s, allow_auto=False),
                     help="目标语言。省略则不翻译，只输出识别结果。常用: zh/en/ja")
     ap.add_argument("--model", default="small",
-                    help="whisper 模型: tiny/base/small/medium/large-v3")
-    ap.add_argument("--ollama-model", default=None,
-                    help="Ollama 模型名。默认 ja→zh 用 trans-ja，其他语言对用 qwen2.5:7b")
+                    help="Whisper 语音识别模型: tiny/base/small/medium/large-v3"
+                         "（不是翻译模型，翻译见 --ollama-model）")
+    ap.add_argument("--ollama-model", default=None, metavar="NAME",
+                    help="Ollama 翻译模型，默认 qwen3.5。"
+                         "用 --list-models 查看本机已安装模型")
     ap.add_argument("--keep-alive", default="10m",
                     help="Ollama 模型在显存中保留的时间，避免频繁卸载重载")
     ap.add_argument("--bilingual", dest="bilingual", action="store_true", default=True,
@@ -371,10 +452,15 @@ def main():
                     help="翻译引擎: ollama=本地离线(默认), trans=translate-shell/Google(快，联网发送文本)")
     ap.add_argument("--list-langs", action="store_true",
                     help="列出 Whisper 支持的语言代码后退出")
+    ap.add_argument("--list-models", action="store_true",
+                    help="列出本机已安装的 Ollama 翻译模型后退出")
     args = ap.parse_args()
 
     if args.list_langs:
         list_langs()
+        return
+    if args.list_models:
+        print_ollama_models()
         return
 
     if args.media is None:
@@ -413,7 +499,9 @@ def main():
         ollama_model = args.ollama_model
         if actually_translate and args.engine == "ollama":
             if not ollama_model:
-                ollama_model = default_ollama_model(src_lang, args.tgt_lang)
+                ollama_model = DEFAULT_OLLAMA_MODEL
+            ensure_ollama_model(ollama_model)
+            print(f"    翻译模型: {ollama_model}")
             warmup_ollama(ollama_model, keep_alive=args.keep_alive)
         elif actually_translate and args.engine == "trans":
             print("    使用 trans (translate-shell/Google) 翻译引擎 (文本将发送到 Google 服务器)")

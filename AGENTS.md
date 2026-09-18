@@ -29,13 +29,9 @@ to bump whisper.cpp itself. If a rebuild is needed:
 cd whisper.cpp && cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Ensure the `trans-ja` Ollama model exists (one-time, from `Modelfile` in repo
-root) if you will translate Japanese→Chinese:
-```
-ollama create trans-ja -f Modelfile
-```
-Other language pairs use `qwen2.5:7b` directly (the same base as `trans-ja`)
-with a generic translation prompt. Override with `--ollama-model`.
+Translation uses local Ollama `qwen3.5` by default (override with
+`--ollama-model`). Ensure the model is pulled (`ollama pull qwen3.5`) if
+it is missing.
 
 Run the pipeline:
 ```
@@ -45,8 +41,10 @@ python3 gen_srt.py /path/to/video.mp4 --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
 python3 gen_srt.py /path/to/video.mp4 --model large-v3
+python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
 python3 gen_srt.py /path/to/video.mp4 --engine trans --to zh   # translate-shell/Google (sends text online)
 python3 gen_srt.py --list-langs
+python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
@@ -70,9 +68,8 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
 - Ollama calls go through the raw `/api/generate` HTTP endpoint (`urllib`),
   not the `ollama` Python package — keep new Ollama calls consistent with
   that (`stream: false`, explicit `keep_alive`).
-- Default Ollama model: `trans-ja` for ja→zh, `qwen2.5:7b` for every other
-  pair. Do not send non-ja→zh text through `trans-ja` (its Modelfile system
-  prompt is Japanese→Chinese only).
+- Default Ollama model: `qwen3.5` for every language pair. Override with
+  `--ollama-model`.
 
 ## Pitfalls
 
@@ -92,3 +89,7 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
 - `--engine trans` sends subtitle text to Google Translate over the network;
   `--engine ollama` (default) is fully offline — don't switch the default
   without calling that out, per user's stated offline/privacy preference.
+- Ollama `/api/generate` calls always send `think: false`. Reasoning models
+  (qwen3.5, deepseek-r1, gpt-oss) otherwise spend the token budget on a
+  hidden chain-of-thought and often return an empty translation. If an old
+  Ollama rejects the field with HTTP 400, the call retries without it.
