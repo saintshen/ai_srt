@@ -113,3 +113,6 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   setup; it aborts. The SenseVoice path always runs that helper on CPU.
 - `/usr/bin/voxtype` is the Vulkan build and cannot run SenseVoice. The
   SenseVoice path must use `voxtype-onnx-avx512` (or `voxtype-onnx-avx2`).
+- Voxtype `transcribe` prints load/INFO logs (sometimes localized, sometimes
+  with ANSI color) on stdout. Always invoke it with `-q`, strip ANSI, and
+  drop log lines before treating leftover text as the cue.

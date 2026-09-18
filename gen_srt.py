@@ -126,6 +126,7 @@ VAD_SEGMENT_RE = re.compile(
 )
 SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
 SENSEVOICE_LANG_TAG_RE = re.compile(r"<\|(zh|en|ja|ko|yue)\|>")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def lang_display(code: str) -> str:
@@ -424,19 +425,38 @@ def strip_sensevoice_text(text: str) -> str:
 
 
 def parse_voxtype_transcript(stdout: str) -> str:
-    lines = []
-    for line in stdout.splitlines():
+    """Keep only the transcript. Voxtype may emit ANSI colors and localized
+    tracing logs (Chinese or English) on the same stream as the text."""
+    text = ANSI_ESCAPE_RE.sub("", stdout or "")
+    kept = []
+    for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
-        if s.startswith(("Loading audio", "Audio format", "Processing ")):
-            continue
-        if " INFO " in s or " WARN " in s or " ERROR " in s or " DEBUG " in s:
+        if s.startswith((
+            "Loading audio", "Audio format", "Processing ",
+            "正在从", "使用全精度", "未找到",
+        )):
             continue
         if re.match(r"^\d{4}-\d{2}-\d{2}T", s):
             continue
-        lines.append(s)
-    return " ".join(lines).strip()
+        if re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG)\b", s):
+            continue
+        if "SenseVoice" in s and any(
+            token in s for token in (
+                "加载", "转录", "模型", "Loading", "loaded",
+                "transcription completed", "full-precision", "int8.onnx",
+            )
+        ):
+            continue
+        kept.append(s)
+    unique = []
+    seen = set()
+    for s in kept:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return " ".join(unique).strip()
 
 
 def vad_speech_segments(wav_path: Path, vad_threshold: float,
@@ -485,15 +505,22 @@ def extract_wav_clip(src_wav: Path, dst_wav: Path, start: float, end: float):
 
 
 def transcribe_sensevoice_clip(bin_path: Path, wav_path: Path, language: str):
-    cmd = [str(bin_path)]
+    cmd = [str(bin_path), "-q"]
     if language in SENSEVOICE_LANGS:
         cmd += ["--language", language]
     cmd += ["transcribe", "--engine", "sensevoice", str(wav_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    result = subprocess.run(
+        cmd, capture_output=True, text=False, timeout=180, env=env,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        err = (result.stderr or result.stdout).strip()
+        err = (stderr or stdout).strip()
         sys.exit(f"SenseVoice (Voxtype ONNX) failed:\n{err[-2000:]}")
-    raw = parse_voxtype_transcript(result.stdout + "\n" + result.stderr)
+    raw = parse_voxtype_transcript(stdout)
     return strip_sensevoice_text(raw), raw
 
 
