@@ -1,15 +1,17 @@
 # ai_srt
 
-本地离线字幕生成：用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（Vulkan GPU）识别语音，需要翻译时再调用本机 [Ollama](https://ollama.com/)。
+English | [中文](README.zh.md)
 
-默认只识别、不翻译，源语言由 Whisper 自动检测。加上 `--to` 才会翻译。翻译默认完全离线（`qwen3.5`）；`--engine trans` 会走 Google，文本会上网。
+Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (Vulkan GPU) for speech recognition, optional local [Ollama](https://ollama.com/) for translation.
 
-顶层脚本是纯 Python 3 标准库，不用 `pip install`。
+Default is transcribe-only. Whisper auto-detects the source language. Pass `--to` to translate. Translation is offline by default (`qwen3.5`); `--engine trans` uses Google and sends text over the network.
 
-## 依赖
+The top-level script is Python 3 stdlib only — no `pip install`.
 
-- Python 3、`ffmpeg`
-- 本仓库自带 `whisper.cpp` 源码。克隆后若还没有 `whisper.cpp/build/bin/whisper-cli`，需要编译一次：
+## Requirements
+
+- Python 3 and `ffmpeg`
+- This repo vendors `whisper.cpp` source. After cloning, if `whisper.cpp/build/bin/whisper-cli` is missing, build it once:
 
 ```bash
 cd whisper.cpp
@@ -17,32 +19,32 @@ cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-- 翻译还需要本机 Ollama 已启动，并拉好模型：
+- Translation also needs a running Ollama daemon and the model:
 
 ```bash
 ollama pull qwen3.5
 ```
 
-Whisper 权重会在首次使用对应 `--model` 时自动下载到 `whisper.cpp/models/`。
+Whisper weights download automatically to `whisper.cpp/models/` on first use of a given `--model` size.
 
-## 用法
+## Usage
 
 ```bash
-# 只识别（输出视频同目录的 video.<源语言>.srt）
+# transcribe only → video.<src>.srt next to the input
 python3 gen_srt.py /path/to/video.mp4
 
-# 指定源语言
+# pin the source language
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
-# 翻译成中文（默认双语：译文 + 原文）
+# translate to Chinese (bilingual by default: translation + original)
 python3 gen_srt.py /path/to/video.mp4 --to zh
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
 
-# 换识别模型 / 翻译模型
+# swap ASR / translation models
 python3 gen_srt.py /path/to/video.mp4 --model large-v3
 python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
 
-# 用 translate-shell / Google（联网）
+# translate-shell / Google (online)
 python3 gen_srt.py /path/to/video.mp4 --to zh --engine trans
 
 python3 gen_srt.py --list-langs
@@ -50,4 +52,6 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
-任意 ffmpeg 能读的视频或音频都可以。翻译模式下输出是 `video.<目标语言>.srt`。
+Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
+
+`whisper.cpp/` is a vendored upstream tree (MIT). It has its own `LICENSE` and contribution docs; those apply to upstream PRs, not this wrapper.

@@ -57,8 +57,9 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
 
 ## Conventions
 
-- All user-facing strings, docstrings, and `--help` text are in Chinese
-  (中文) — match this when editing or adding CLI options.
+- All user-facing strings, docstrings, comments, and `--help` text are in
+  English. Keep a Chinese README at `README.zh.md` in sync with `README.md`.
+  Language aliases in `LANG_ALIASES` may still accept CJK input.
 - Progress is printed as numbered stages (`[1/3] ...`, `[2/3] ...`, `[3/3]
   ...`); follow the same style for new pipeline steps. Transcribe-only runs
   are `[1/2]` + `[2/2]`.

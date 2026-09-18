@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-通用字幕生成：本地 whisper.cpp (Vulkan GPU) 识别语音，可选本地 Ollama /
-translate-shell 翻译，写出 .srt。
+Generate subtitles from video or audio: local whisper.cpp (Vulkan GPU) for
+speech recognition, optional local Ollama or translate-shell for translation.
 
-任意 ffmpeg 能读的视频/音频均可。默认只识别、不翻译；源语言默认由 Whisper
-自动检测，可用 --from 指定。加 --to 才翻译。
+Any ffmpeg-readable file works. Default is transcribe-only (no translation);
+Whisper auto-detects the source language, override with --from. Pass --to to
+translate.
 
-翻译引擎 (--engine)：
-    ollama (默认): 完全本地离线，默认用 qwen3.5 + 通用翻译提示词。
-    trans: 调用 translate-shell (trans 命令) 走 Google 翻译 API
-        （文本会发送到 Google，非离线）。
+Translation engines (--engine):
+    ollama (default): fully offline, qwen3.5 with a generic translation prompt.
+    trans: translate-shell (trans) via the Google Translate API
+        (sends text to Google; not offline).
 
-用法:
+Usage:
     python3 gen_srt.py /path/to/video.mp4
     python3 gen_srt.py /path/to/video.mp4 --from ja
     python3 gen_srt.py /path/to/video.mp4 --to zh
@@ -24,9 +25,9 @@ translate-shell 翻译，写出 .srt。
     python3 gen_srt.py --list-models
     python3 gen_srt.py --help
 
-输出:
-    只识别:   /path/to/video.<源语言>.srt
-    翻译模式: /path/to/video.<目标语言>.srt
+Output:
+    transcribe-only: /path/to/video.<src>.srt
+    translate:       /path/to/video.<tgt>.srt
 """
 import argparse
 import json
@@ -47,7 +48,7 @@ VAD_MODEL = MODELS_DIR / "ggml-silero-v6.2.0.bin"
 
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
 
-# whisper.cpp 支持的语言代码 → 英文名（与 src/whisper.cpp g_lang 对齐）
+# whisper.cpp language codes → English names (aligned with src/whisper.cpp g_lang)
 WHISPER_LANGS = {
     "en": "english", "zh": "chinese", "de": "german", "es": "spanish",
     "ru": "russian", "ko": "korean", "fr": "french", "ja": "japanese",
@@ -76,17 +77,13 @@ WHISPER_LANGS = {
     "ba": "bashkir", "jw": "javanese", "su": "sundanese", "yue": "cantonese",
 }
 
-# 翻译提示词里用的中文名；未列出的回退到英文名
-LANG_ZH_NAMES = {
-    "en": "英文", "zh": "简体中文", "ja": "日文", "ko": "韩文",
-    "de": "德文", "fr": "法文", "es": "西班牙文", "ru": "俄文",
-    "pt": "葡萄牙文", "it": "意大利文", "vi": "越南文", "th": "泰文",
-    "ar": "阿拉伯文", "hi": "印地文", "id": "印尼文", "nl": "荷兰文",
-    "pl": "波兰文", "tr": "土耳其文", "uk": "乌克兰文", "sv": "瑞典文",
-    "yue": "粤语", "zh-CN": "简体中文",
+# Names used in the translation prompt; unlisted codes fall back to WHISPER_LANGS
+LANG_PROMPT_NAMES = {
+    "zh": "Simplified Chinese", "zh-CN": "Simplified Chinese",
+    "yue": "Cantonese",
 }
 
-# 用户输入别名 → whisper 代码
+# User-facing aliases → whisper code (CJK aliases kept as input convenience)
 LANG_ALIASES = {
     "auto": "auto", "detect": "auto",
     "zh-cn": "zh", "zh-hans": "zh", "zh-tw": "zh", "zh-hant": "zh",
@@ -107,7 +104,7 @@ LANG_ALIASES = {
     "portuguese": "pt", "葡萄牙语": "pt", "pt-br": "pt", "pt-pt": "pt",
 }
 
-# translate-shell 对中文要用 zh-CN，其余与 whisper 代码一致
+# translate-shell wants zh-CN for Chinese; other codes match whisper
 TRANS_CODES = {"zh": "zh-CN"}
 
 AUTO_LANG_RE = re.compile(r"auto-detected language:\s+(\S+)\s+\(p\s*=")
@@ -118,8 +115,8 @@ MUSIC_PLACEHOLDER_RE = re.compile(r"^[\(（][^)）]*[\)）]$|^[♪\s]+$")
 
 
 def lang_display(code: str) -> str:
-    if code in LANG_ZH_NAMES:
-        return LANG_ZH_NAMES[code]
+    if code in LANG_PROMPT_NAMES:
+        return LANG_PROMPT_NAMES[code]
     if code in WHISPER_LANGS:
         return WHISPER_LANGS[code]
     return code
@@ -131,12 +128,12 @@ def normalize_lang(value: str, allow_auto: bool = False) -> str:
     if key in ("auto", "detect", ""):
         if allow_auto:
             return "auto"
-        raise argparse.ArgumentTypeError("目标语言不能是 auto")
+        raise argparse.ArgumentTypeError("target language cannot be auto")
     resolved = LANG_ALIASES.get(raw) or LANG_ALIASES.get(key)
     if resolved == "auto":
         if allow_auto:
             return "auto"
-        raise argparse.ArgumentTypeError("目标语言不能是 auto")
+        raise argparse.ArgumentTypeError("target language cannot be auto")
     if resolved:
         return resolved
     if key in WHISPER_LANGS:
@@ -144,8 +141,10 @@ def normalize_lang(value: str, allow_auto: bool = False) -> str:
     for code, name in WHISPER_LANGS.items():
         if name == key:
             return code
-    hint = "（也可用 auto）" if allow_auto else ""
-    raise argparse.ArgumentTypeError(f"未知语言: {value}{hint}。查看 --list-langs")
+    hint = " (auto is also allowed)" if allow_auto else ""
+    raise argparse.ArgumentTypeError(
+        f"unknown language: {value}{hint}. See --list-langs"
+    )
 
 
 def trans_code(code: str) -> str:
@@ -160,13 +159,13 @@ def ollama_base_url(ollama_url: str) -> str:
 
 
 def list_ollama_models(ollama_url: str = "http://localhost:11434/api/generate"):
-    """返回 [(name, details, size), ...]，连不上 Ollama 则直接退出。"""
+    """Return [(name, details, size), ...]; exit if Ollama is unreachable."""
     tags_url = ollama_base_url(ollama_url) + "/api/tags"
     try:
         with urllib.request.urlopen(tags_url, timeout=10) as resp:
             data = json.load(resp)
     except Exception as e:
-        sys.exit(f"无法连接 Ollama ({tags_url}): {e}")
+        sys.exit(f"cannot reach Ollama ({tags_url}): {e}")
     models = []
     for m in data.get("models", []):
         name = m.get("name") or ""
@@ -179,16 +178,16 @@ def list_ollama_models(ollama_url: str = "http://localhost:11434/api/generate"):
 def print_ollama_models():
     models = list_ollama_models()
     if not models:
-        print("本机没有已安装的 Ollama 模型。用 ollama pull <name> 下载。")
+        print("No local Ollama models installed. Download one with: ollama pull <name>")
         return
-    print(f"{'模型':<24} {'参数量':<10} 大小")
+    print(f"{'model':<24} {'params':<10} size")
     for name, details, size in models:
         params = details.get("parameter_size") or ""
         size_gb = f"{size / 1e9:.1f} GB" if size else ""
         print(f"{name:<24} {params:<10} {size_gb}")
     print()
-    print("用法: python3 gen_srt.py video.mp4 --to zh --ollama-model <模型名>")
-    print(f"默认: {DEFAULT_OLLAMA_MODEL}")
+    print("usage: python3 gen_srt.py video.mp4 --to zh --ollama-model <name>")
+    print(f"default: {DEFAULT_OLLAMA_MODEL}")
 
 
 def ollama_model_installed(name: str, installed: list) -> bool:
@@ -207,18 +206,19 @@ def ensure_ollama_model(name: str):
     installed = [m[0] for m in list_ollama_models()]
     if ollama_model_installed(name, installed):
         return
-    listing = "\n".join(f"    {n}" for n in installed) or "    (无)"
+    listing = "\n".join(f"    {n}" for n in installed) or "    (none)"
     sys.exit(
-        f"Ollama 模型不存在: {name}\n本机已安装:\n{listing}\n"
-        f"查看: python3 gen_srt.py --list-models\n"
-        f"下载: ollama pull {name}"
+        f"Ollama model not found: {name}\ninstalled:\n{listing}\n"
+        f"list: python3 gen_srt.py --list-models\n"
+        f"pull: ollama pull {name}"
     )
 
 
 def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
                     ollama_url: str = "http://localhost:11434/api/generate",
                     options=None, timeout: int = 180) -> dict:
-    """调用 /api/generate。默认关闭 think，避免推理模型把额度耗在思考上、译文为空。"""
+    """POST /api/generate. Always send think=false so reasoning models emit
+    the translation instead of burning the token budget on a hidden CoT."""
     payload = {
         "model": ollama_model,
         "prompt": prompt,
@@ -241,7 +241,7 @@ def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
         return _post(payload)
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        # 旧版 Ollama / 不认识 think 字段的模型会 400，去掉后再试一次
+        # Older Ollama / models that reject `think` return HTTP 400; retry once.
         if e.code == 400 and "think" in payload:
             payload.pop("think", None)
             try:
@@ -249,9 +249,11 @@ def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
             except urllib.error.HTTPError as e2:
                 err_body = e2.read().decode("utf-8", errors="replace")
                 raise RuntimeError(
-                    f"Ollama 请求失败 HTTP {e2.code}: {err_body[:500]}"
+                    f"Ollama request failed HTTP {e2.code}: {err_body[:500]}"
                 ) from e2
-        raise RuntimeError(f"Ollama 请求失败 HTTP {e.code}: {err_body[:500]}") from e
+        raise RuntimeError(
+            f"Ollama request failed HTTP {e.code}: {err_body[:500]}"
+        ) from e
 
 
 def extract_audio(media_path: Path, wav_path: Path, stage: str):
@@ -260,17 +262,17 @@ def extract_audio(media_path: Path, wav_path: Path, stage: str):
         "-vn", "-ar", "16000", "-ac", "1",
         str(wav_path),
     ]
-    print(f"{stage} 提取音频...")
+    print(f"{stage} extracting audio...")
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
-        sys.exit(f"ffmpeg 失败:\n{err[-2000:]}")
+        sys.exit(f"ffmpeg failed:\n{err[-2000:]}")
 
 
 def ensure_model(model_size: str) -> Path:
     model_path = MODELS_DIR / f"ggml-{model_size}.bin"
     if not model_path.exists():
-        print(f"    下载模型 {model_size} ...")
+        print(f"    downloading Whisper model {model_size} ...")
         subprocess.run(
             ["bash", str(WHISPER_CPP_DIR / "models" / "download-ggml-model.sh"), model_size],
             check=True, cwd=WHISPER_CPP_DIR,
@@ -287,9 +289,9 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
                vad_threshold: float = 0.5, vad_min_silence_ms: int = 100,
                stage: str = "[2/3]"):
     if language == "auto":
-        print(f"{stage} 用 whisper-cli (Vulkan GPU) 自动检测语言并识别语音...")
+        print(f"{stage} transcribing with whisper-cli (Vulkan GPU), auto-detecting language...")
     else:
-        print(f"{stage} 用 whisper-cli (Vulkan GPU) 识别{lang_display(language)}语音...")
+        print(f"{stage} transcribing {lang_display(language)} with whisper-cli (Vulkan GPU)...")
     cmd = [
         str(WHISPER_CLI),
         "-m", str(model_path),
@@ -303,38 +305,39 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
             "-vt", str(vad_threshold),
             "-vsd", str(vad_min_silence_ms),
         ]
-        print(f"    已启用 VAD (语音活动检测)，跳过无人声段落 "
-              f"(阈值={vad_threshold}, 最小静音时长={vad_min_silence_ms}ms)")
+        print(f"    VAD enabled, skipping non-speech "
+              f"(threshold={vad_threshold}, min silence={vad_min_silence_ms}ms)")
     elif use_vad:
-        print(f"    警告: VAD 模型不存在 ({VAD_MODEL})，跳过 VAD，处理完整音频")
+        print(f"    warning: VAD model missing ({VAD_MODEL}), processing full audio")
     if suppress_music:
-        # -sns 抑制模型内置的非语音特殊 token
-        # --suppress-regex 额外过滤 (音楽)/(拍手)/(music) 等占位符文本
+        # -sns drops the model's non-speech special tokens
+        # --suppress-regex also filters placeholders like (音楽)/(拍手)/(music)
         cmd += [
             "-sns",
             "--suppress-regex", r"[\(（][^)）]*[\)）]|♪+",
         ]
-        print(f"    已启用非语音占位符抑制 (如 (音楽)/(拍手)/(music) 等)")
+        print("    non-speech placeholder suppression enabled (e.g. (音楽)/(拍手)/(music))")
     env = os.environ.copy()
     lib_dir = str(WHISPER_CPP_DIR / "build" / "bin")
     env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
-    # 用 text=False 拿原始字节，再手动宽松解码，避免 whisper-cli 日志中
-    # 偶发的非 UTF-8 字节 (进度条/终端控制字符等) 导致 UnicodeDecodeError 崩溃
+    # Capture raw bytes and decode loosely: whisper-cli stderr/progress can
+    # contain non-UTF-8 bytes (progress bars, terminal control chars) that
+    # would crash with text=True.
     result = subprocess.run(cmd, capture_output=True, text=False, env=env)
     stdout_text = result.stdout.decode("utf-8", errors="replace")
     stderr_text = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        sys.exit(f"whisper-cli 失败:\n{stderr_text[-2000:]}")
+        sys.exit(f"whisper-cli failed:\n{stderr_text[-2000:]}")
 
     detected = language
     if language == "auto":
         matches = AUTO_LANG_RE.findall(stderr_text)
         if matches:
             detected = matches[-1]
-            print(f"    检测到源语言: {detected} ({lang_display(detected)})")
+            print(f"    detected source language: {detected} ({lang_display(detected)})")
         else:
             detected = "unk"
-            print("    警告: 未能从 whisper 日志解析到源语言，按未知语言处理")
+            print("    warning: could not parse source language from whisper log; treating as unknown")
 
     segments = []
     skipped = 0
@@ -351,26 +354,28 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
                 skipped += 1
                 continue
             segments.append((start, end, text))
-    print(f"    识别到 {len(segments)} 段" + (f" (另过滤掉 {skipped} 段非语音占位符)" if skipped else ""))
+    extra = f" (filtered {skipped} non-speech placeholders)" if skipped else ""
+    print(f"    {len(segments)} segments{extra}")
     return segments, detected
 
 
 def warmup_ollama(ollama_model: str, keep_alive: str = "10m",
                   ollama_url: str = "http://localhost:11434/api/generate"):
-    """提前把模型加载进显存并设置保留时间，避免翻译时中途卸载重载。"""
-    print(f"    预热 Ollama 模型 {ollama_model} (keep_alive={keep_alive}) ...")
-    ollama_generate(ollama_model, "你好", keep_alive=keep_alive, ollama_url=ollama_url)
-    print("    预热完成，模型已常驻显存")
+    """Load the model into VRAM and pin keep_alive so it is not unloaded mid-run."""
+    print(f"    warming up Ollama model {ollama_model} (keep_alive={keep_alive}) ...")
+    ollama_generate(ollama_model, "hello", keep_alive=keep_alive, ollama_url=ollama_url)
+    print("    warmup done, model is resident in VRAM")
 
 
 def translate_ollama(text: str, src: str, tgt: str, ollama_model: str,
                      keep_alive: str = "10m",
                      ollama_url: str = "http://localhost:11434/api/generate") -> str:
-    src_name = lang_display(src) if src not in ("auto", "unk") else "原文"
+    src_name = lang_display(src) if src not in ("auto", "unk") else "source text"
     tgt_name = lang_display(tgt)
     prompt = (
-        f"请将下面的{src_name}翻译成{tgt_name}，只输出译文本身，"
-        f"不要添加任何解释、拼音、罗马音或引号：\n{text}"
+        f"Translate the following {src_name} into {tgt_name}. "
+        f"Output only the translation itself, with no explanations, "
+        f"pinyin, romanization, or quotation marks:\n{text}"
     )
     data = ollama_generate(
         ollama_model, prompt, keep_alive=keep_alive, ollama_url=ollama_url,
@@ -380,8 +385,8 @@ def translate_ollama(text: str, src: str, tgt: str, ollama_model: str,
 
 
 def translate_trans(text: str, src: str, tgt: str) -> str:
-    """用 translate-shell (trans 命令) 调用 Google 翻译 API。
-    注意: 这会把文本发送到 Google 服务器, 不是本地离线翻译。"""
+    """Call Google Translate via translate-shell (`trans`).
+    Sends text to Google; this is not offline translation."""
     src_code = trans_code(src) if src not in ("auto", "unk") else ""
     pair = f"{src_code}:{trans_code(tgt)}"
     result = subprocess.run(
@@ -389,7 +394,7 @@ def translate_trans(text: str, src: str, tgt: str) -> str:
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"trans 命令失败: {result.stderr.strip()}")
+        raise RuntimeError(f"trans failed: {result.stderr.strip()}")
     return result.stdout.strip()
 
 
@@ -409,51 +414,51 @@ def srt_timestamp(seconds: float) -> str:
 
 
 def list_langs():
-    print(f"{'代码':<6} {'英文名':<20} 中文名")
+    print(f"{'code':<6} {'name':<20}")
     for code, name in sorted(WHISPER_LANGS.items()):
-        zh = LANG_ZH_NAMES.get(code, "")
-        print(f"{code:<6} {name:<20} {zh}")
+        print(f"{code:<6} {name:<20}")
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="从视频/音频生成字幕（本地 Whisper 识别，可选翻译）",
+        description="Generate subtitles from video or audio (local Whisper, optional translation)",
     )
     ap.add_argument("media", type=Path, nargs="?",
-                    help="视频或音频文件（ffmpeg 能读即可）")
+                    help="video or audio file (anything ffmpeg can read)")
     ap.add_argument("--from", dest="src_lang", default="auto", metavar="LANG",
                     type=lambda s: normalize_lang(s, allow_auto=True),
-                    help="源语言代码，默认 auto（Whisper 自动检测）。常用: ja/en/zh/ko")
+                    help="source language code, default auto (Whisper detect). Common: ja/en/zh/ko")
     ap.add_argument("--to", dest="tgt_lang", default=None, metavar="LANG",
                     type=lambda s: normalize_lang(s, allow_auto=False),
-                    help="目标语言。省略则不翻译，只输出识别结果。常用: zh/en/ja")
+                    help="target language. Omit to transcribe only. Common: zh/en/ja")
     ap.add_argument("--model", default="small",
-                    help="Whisper 语音识别模型: tiny/base/small/medium/large-v3"
-                         "（不是翻译模型，翻译见 --ollama-model）")
+                    help="Whisper ASR model: tiny/base/small/medium/large-v3 "
+                         "(not the translator; see --ollama-model)")
     ap.add_argument("--ollama-model", default=None, metavar="NAME",
-                    help="Ollama 翻译模型，默认 qwen3.5。"
-                         "用 --list-models 查看本机已安装模型")
+                    help="Ollama translation model, default qwen3.5. "
+                         "See --list-models for locally installed models")
     ap.add_argument("--keep-alive", default="10m",
-                    help="Ollama 模型在显存中保留的时间，避免频繁卸载重载")
+                    help="how long to keep the Ollama model in VRAM, to avoid reload")
     ap.add_argument("--bilingual", dest="bilingual", action="store_true", default=True,
-                    help="双语字幕：每条同时显示译文和原文（翻译模式下默认开启）")
+                    help="bilingual SRT: translation plus original (on by default when translating)")
     ap.add_argument("--no-bilingual", dest="bilingual", action="store_false",
-                    help="关闭双语字幕，只输出译文")
+                    help="translation only, no original line")
     ap.add_argument("--no-vad", action="store_true",
-                    help="禁用 VAD，处理完整音频（不跳过静音段）")
+                    help="disable VAD and process the full audio (do not skip silence)")
     ap.add_argument("--vad-threshold", type=float, default=0.5,
-                    help="VAD 判定为'有人声'的阈值，默认0.5，范围0-1。"
-                         "调低(如0.3)对能量突变更敏感，能识别更多叫声/弱语音混合片段，但误检也会增多")
+                    help="VAD speech threshold, default 0.5, range 0-1. "
+                         "Lower (e.g. 0.3) catches more weak speech, with more false positives")
     ap.add_argument("--vad-min-silence", type=int, default=100,
-                    help="VAD 最小静音时长(ms)，默认100，用于切分语音段落。调低能更快响应短促的声音变化")
+                    help="VAD minimum silence in ms, default 100, used to split segments")
     ap.add_argument("--no-suppress-music", action="store_true",
-                    help="禁用 (音楽)/(拍手)/(music) 等非语音占位符抑制")
+                    help="keep non-speech placeholders such as (音楽)/(拍手)/(music)")
     ap.add_argument("--engine", choices=["ollama", "trans"], default="ollama",
-                    help="翻译引擎: ollama=本地离线(默认), trans=translate-shell/Google(快，联网发送文本)")
+                    help="translation engine: ollama=local offline (default), "
+                         "trans=translate-shell/Google (faster, sends text online)")
     ap.add_argument("--list-langs", action="store_true",
-                    help="列出 Whisper 支持的语言代码后退出")
+                    help="list Whisper language codes and exit")
     ap.add_argument("--list-models", action="store_true",
-                    help="列出本机已安装的 Ollama 翻译模型后退出")
+                    help="list local Ollama translation models and exit")
     args = ap.parse_args()
 
     if args.list_langs:
@@ -464,11 +469,11 @@ def main():
         return
 
     if args.media is None:
-        ap.error("请提供视频或音频文件")
+        ap.error("please provide a video or audio file")
 
     media_path = args.media.resolve()
     if not media_path.exists():
-        sys.exit(f"文件不存在: {media_path}")
+        sys.exit(f"file not found: {media_path}")
 
     do_translate = args.tgt_lang is not None
     n_stages = 3 if do_translate else 2
@@ -490,21 +495,21 @@ def main():
         src_lang = detected_lang if args.src_lang == "auto" else args.src_lang
         actually_translate = do_translate and src_lang != args.tgt_lang
         if do_translate and not actually_translate:
-            print(f"    源语言与目标语言相同 ({src_lang})，跳过翻译")
+            print(f"    source and target are the same ({src_lang}), skipping translation")
 
         out_tag = args.tgt_lang if actually_translate else src_lang
         out_srt = Path(str(media_path.with_suffix("")) + f".{out_tag}.srt")
 
-        print(f"[{n_stages}/{n_stages}] 写入字幕: {out_srt}")
+        print(f"[{n_stages}/{n_stages}] writing subtitles: {out_srt}")
         ollama_model = args.ollama_model
         if actually_translate and args.engine == "ollama":
             if not ollama_model:
                 ollama_model = DEFAULT_OLLAMA_MODEL
             ensure_ollama_model(ollama_model)
-            print(f"    翻译模型: {ollama_model}")
+            print(f"    translation model: {ollama_model}")
             warmup_ollama(ollama_model, keep_alive=args.keep_alive)
         elif actually_translate and args.engine == "trans":
-            print("    使用 trans (translate-shell/Google) 翻译引擎 (文本将发送到 Google 服务器)")
+            print("    using trans (translate-shell/Google); text will be sent to Google")
 
         with open(out_srt, "w", encoding="utf-8") as f:
             idx = 1
@@ -513,7 +518,7 @@ def main():
                     f.write(f"{idx}\n")
                     f.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n")
                     f.write(f"{src_text}\n\n")
-                    print(f"  [{idx}] {start:.1f}-{end:.1f}: (识别完成，长度 {len(src_text)} 字符)")
+                    print(f"  [{idx}] {start:.1f}-{end:.1f}: (transcribed, {len(src_text)} chars)")
                     idx += 1
                     continue
                 tgt_text = translate_text(
@@ -526,10 +531,10 @@ def main():
                     f.write(f"{tgt_text}\n{src_text}\n\n")
                 else:
                     f.write(f"{tgt_text}\n\n")
-                print(f"  [{idx}] {start:.1f}-{end:.1f}: (已翻译)")
+                print(f"  [{idx}] {start:.1f}-{end:.1f}: (translated)")
                 idx += 1
 
-    print(f"完成! 字幕已保存到: {out_srt}")
+    print(f"done. subtitles saved to: {out_srt}")
 
 
 if __name__ == "__main__":
