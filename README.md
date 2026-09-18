@@ -54,4 +54,8 @@ python3 gen_srt.py --help
 
 Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
 
-`whisper.cpp/` is a vendored upstream tree (MIT). It has its own `LICENSE` and contribution docs; those apply to upstream PRs, not this wrapper.
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+`whisper.cpp/` is a vendored upstream tree, also MIT (copyright The ggml authors; see `whisper.cpp/LICENSE`). Its contribution docs apply to upstream PRs, not this wrapper.

@@ -54,4 +54,8 @@ python3 gen_srt.py --help
 
 任意 ffmpeg 能读的视频或音频都可以。翻译模式下输出是 `video.<目标语言>.srt`。
 
-`whisper.cpp/` 是上游源码树（MIT），自带 `LICENSE` 和贡献说明；那些规则只针对上游 PR，不适用于本仓库的包装脚本。
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。
+
+`whisper.cpp/` 是上游源码树，同样为 MIT（版权归 The ggml authors，见 `whisper.cpp/LICENSE`）。其中的贡献说明只针对上游 PR，不适用于本仓库的包装脚本。
