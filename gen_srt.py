@@ -127,6 +127,12 @@ VAD_SEGMENT_RE = re.compile(
 SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
 SENSEVOICE_LANG_TAG_RE = re.compile(r"<\|(zh|en|ja|ko|yue)\|>")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# ESC often lost by the time text hits an SRT file, leaving "[32m INFO[0m"
+ANSI_SGR_RE = re.compile(r"\[(?:\d{1,3};)*\d{1,3}m")
+ISO_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
+VOXTYPE_COMPLETED_QUOTE_RE = re.compile(
+    r"(?:transcription completed|转录完成)[^\"「]*[\"「](.+?)[\"」]"
+)
 
 
 def lang_display(code: str) -> str:
@@ -424,35 +430,53 @@ def strip_sensevoice_text(text: str) -> str:
     return SENSEVOICE_TAG_RE.sub("", text).strip()
 
 
+def _voxtype_noise_line(s: str) -> bool:
+    if s.startswith((
+        "Loading audio", "Audio format", "Processing ",
+        "正在从", "使用全精度", "未找到",
+    )):
+        return True
+    if re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG)\b", s):
+        return True
+    if "SenseVoice" in s and any(
+        token in s for token in (
+            "加载", "转录", "模型", "Loading", "loaded",
+            "transcription completed", "full-precision", "int8.onnx",
+        )
+    ):
+        return True
+    return False
+
+
 def parse_voxtype_transcript(stdout: str) -> str:
-    """Keep only the transcript. Voxtype may emit ANSI colors and localized
-    tracing logs (Chinese or English) on the same stream as the text."""
+    """Keep only the spoken text.
+
+    Voxtype may dump ANSI-colored, localized INFO logs on the same stream,
+    often concatenated onto one line with the transcript after
+    `转录完成...："..."`.
+    """
     text = ANSI_ESCAPE_RE.sub("", stdout or "")
-    kept = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
+    text = ANSI_SGR_RE.sub("", text)
+
+    quoted = []
+    for m in VOXTYPE_COMPLETED_QUOTE_RE.finditer(text):
+        q = m.group(1).strip()
+        if q and not q.endswith("..."):
+            quoted.append(q)
+
+    # Break concatenated logs so leftover spoken text can be kept.
+    split = ISO_TIMESTAMP_RE.sub("\n", text)
+    leftover = []
+    for line in split.splitlines():
+        s = line.strip(" \t:-")
+        s = re.sub(r'^[\"「]|[\"」]$', "", s).strip()
+        if not s or _voxtype_noise_line(s):
             continue
-        if s.startswith((
-            "Loading audio", "Audio format", "Processing ",
-            "正在从", "使用全精度", "未找到",
-        )):
-            continue
-        if re.match(r"^\d{4}-\d{2}-\d{2}T", s):
-            continue
-        if re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG)\b", s):
-            continue
-        if "SenseVoice" in s and any(
-            token in s for token in (
-                "加载", "转录", "模型", "Loading", "loaded",
-                "transcription completed", "full-precision", "int8.onnx",
-            )
-        ):
-            continue
-        kept.append(s)
+        leftover.append(s)
+
     unique = []
     seen = set()
-    for s in kept:
+    for s in quoted + leftover:
         if s not in seen:
             seen.add(s)
             unique.append(s)
