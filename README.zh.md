@@ -6,7 +6,7 @@
 
 默认只识别、不翻译，源语言由 Whisper 自动检测。加上 `--to` 才会翻译。翻译默认完全离线（`qwen3.5`）；`--engine trans` 会走 Google，文本会上网。
 
-顶层脚本是纯 Python 3 标准库，不用 `pip install`。SenseVoice 首次使用会下载 FunASR 的 `llama-funasr-sensevoice` 二进制和 GGUF 权重。
+顶层脚本是纯 Python 3 标准库，不用 `pip install`。SenseVoice 使用本地编译的 FunASR llama.cpp 二进制；GGUF 权重会在首次使用时下载。
 
 ## 依赖
 
@@ -17,6 +17,14 @@
 cd whisper.cpp
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+```
+
+- SenseVoice（`--asr sensevoice`）需要本地编译 FunASR 的 llama.cpp 运行时：
+
+```bash
+cd funasr-llamacpp
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-funasr-sensevoice
 ```
 
 - 翻译还需要本机 Ollama 已启动，并拉好模型：
@@ -62,3 +70,5 @@ python3 gen_srt.py --help
 本项目使用 [MIT License](LICENSE)。
 
 `whisper.cpp/` 是上游源码树，同样为 MIT（版权归 The ggml authors，见 `whisper.cpp/LICENSE`）。其中的贡献说明只针对上游 PR，不适用于本仓库的包装脚本。
+
+`funasr-llamacpp/` 来自 FunASR 的 `runtime/llama.cpp`（见 [FunASR](https://github.com/modelscope/FunASR)）；编译时 CMake 会把 llama.cpp 拉到 `build/`。

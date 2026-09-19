@@ -6,7 +6,7 @@ Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cp
 
 Default is transcribe-only. Whisper auto-detects the source language. Pass `--to` to translate. Translation is offline by default (`qwen3.5`); `--engine trans` uses Google and sends text over the network.
 
-The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice downloads FunASR's `llama-funasr-sensevoice` binary and GGUF weights on first use.
+The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice uses a locally built FunASR llama.cpp binary; GGUF weights download on first use.
 
 ## Requirements
 
@@ -17,6 +17,14 @@ The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice do
 cd whisper.cpp
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+```
+
+- SenseVoice (`--asr sensevoice`) needs a local FunASR llama.cpp build:
+
+```bash
+cd funasr-llamacpp
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-funasr-sensevoice
 ```
 
 - Translation also needs a running Ollama daemon and the model:
@@ -62,3 +70,5 @@ Any ffmpeg-readable video or audio works. In translate mode the output is `video
 This project is licensed under the [MIT License](LICENSE).
 
 `whisper.cpp/` is a vendored upstream tree, also MIT (copyright The ggml authors; see `whisper.cpp/LICENSE`). Its contribution docs apply to upstream PRs, not this wrapper.
+
+`funasr-llamacpp/` is FunASR's `runtime/llama.cpp` (see [FunASR](https://github.com/modelscope/FunASR)); CMake fetches llama.cpp into `build/` at compile time.

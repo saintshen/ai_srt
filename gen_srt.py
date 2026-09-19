@@ -40,7 +40,6 @@ import os
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -54,16 +53,11 @@ VAD_MODEL = MODELS_DIR / "ggml-silero-v6.2.0.bin"
 VOXTYPE_TURBO = Path.home() / ".local/share/voxtype/models/ggml-large-v3-turbo.bin"
 
 FUNASR_DIR = ROOT / "funasr-llamacpp"
-FUNASR_BIN = FUNASR_DIR / "llama-funasr-sensevoice"
+FUNASR_BIN = FUNASR_DIR / "build" / "bin" / "llama-funasr-sensevoice"
 FUNASR_GGUF_DIR = FUNASR_DIR / "gguf"
 FUNASR_MODEL = FUNASR_GGUF_DIR / "sensevoice-small-q8.gguf"
 FUNASR_VAD = FUNASR_GGUF_DIR / "fsmn-vad.gguf"
 FUNASR_VULKAN_MARKER = FUNASR_DIR / ".vulkan-broken"
-FUNASR_RELEASE = "runtime-llamacpp-v0.2.1"
-FUNASR_TARBALL_URL = (
-    "https://github.com/modelscope/FunASR/releases/download/"
-    f"{FUNASR_RELEASE}/funasr-llamacpp-linux-x64-vulkan.tar.gz"
-)
 FUNASR_MODEL_URL = (
     "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/main/"
     "sensevoice-small-q8.gguf"
@@ -424,24 +418,15 @@ def download_file(url: str, dest: Path):
 
 
 def ensure_funasr_runtime():
-    """Fetch FunASR llama.cpp SenseVoice binary + GGUF weights if missing."""
+    """Require a locally built SenseVoice binary; download GGUF weights if missing."""
     if not FUNASR_BIN.is_file():
-        tarball = FUNASR_DIR / "funasr-llamacpp-linux-x64-vulkan.tar.gz"
-        download_file(FUNASR_TARBALL_URL, tarball)
-        print(f"    extracting {tarball.name}")
-        with tarfile.open(tarball, "r:gz") as tar:
-            member = None
-            for m in tar.getmembers():
-                name = Path(m.name).name
-                if name == "llama-funasr-sensevoice" and m.isfile():
-                    member = m
-                    break
-            if member is None:
-                sys.exit(f"llama-funasr-sensevoice missing from {tarball}")
-            member.name = "llama-funasr-sensevoice"
-            tar.extract(member, path=FUNASR_DIR)
-        FUNASR_BIN.chmod(0o755)
-        tarball.unlink(missing_ok=True)
+        sys.exit(
+            f"llama-funasr-sensevoice missing: {FUNASR_BIN}\n"
+            "Build it like whisper.cpp (Vulkan):\n"
+            "  cd funasr-llamacpp && cmake -B build -DGGML_VULKAN=ON "
+            "-DCMAKE_BUILD_TYPE=Release && cmake --build build -j "
+            "--target llama-funasr-sensevoice"
+        )
     if not FUNASR_MODEL.is_file():
         download_file(FUNASR_MODEL_URL, FUNASR_MODEL)
     if not FUNASR_VAD.is_file():
@@ -641,8 +626,7 @@ def main():
                          "sensevoice=SenseVoice Small via FunASR llama.cpp/ggml "
                          "(Japanese / zh/en/ja/ko/yue)")
     ap.add_argument("--sv-backend", choices=["auto", "cpu", "vulkan"], default="auto",
-                    help="SenseVoice compute backend. auto tries Vulkan then CPU "
-                         "(RX 9070 XT currently crashes on Vulkan and falls back)")
+                    help="SenseVoice compute backend. auto tries Vulkan then CPU")
     ap.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
                     help="Whisper ASR model: tiny/base/small/medium/large-v3/"
                          "large-v3-turbo (default large-v3-turbo; ignored with "

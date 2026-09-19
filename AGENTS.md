@@ -31,6 +31,15 @@ to bump whisper.cpp itself. If a rebuild is needed:
 cd whisper.cpp && cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
+`funasr-llamacpp/` is FunASR's `runtime/llama.cpp` (vendored). CMake fetches
+a pinned llama.cpp into `funasr-llamacpp/build/` (gitignored). Build SenseVoice:
+```
+cd funasr-llamacpp && cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target llama-funasr-sensevoice
+```
+Do not use FunASR's GitHub prebuilt `funasr-llamacpp-*-vulkan.tar.gz`; compile
+locally like whisper.cpp. GGUF weights download on first `--asr sensevoice` into
+`funasr-llamacpp/gguf/`.
+
 Translation uses local Ollama `qwen3.5` by default (override with
 `--ollama-model`). Ensure the model is pulled (`ollama pull qwen3.5`) if
 it is missing.
@@ -57,13 +66,11 @@ Output is written next to the input: `video.<src>.srt` (transcribe) or
 If `~/.local/share/voxtype/models/ggml-large-v3-turbo.bin` already exists,
 `--model large-v3-turbo` symlinks that file instead of downloading again.
 
-`--asr sensevoice` is for Japanese (also zh/en/ko/yue). It uses FunASR's
-prebuilt `llama-funasr-sensevoice` (ggml/llama.cpp), not Voxtype. First use
-downloads the Linux Vulkan tarball plus `sensevoice-small-q8.gguf` and
-`fsmn-vad.gguf` into `funasr-llamacpp/` (gitignored). `--sv-backend auto`
-tries Vulkan then CPU; this RX 9070 XT currently segfaults on the Vulkan
-build, so the script records `funasr-llamacpp/.vulkan-broken` and retries
-CPU. `--srt` + `--vad` come from the FunASR binary (clean SRT on stdout).
+`--asr sensevoice` is for Japanese (also zh/en/ko/yue). It runs the
+locally built `funasr-llamacpp/build/bin/llama-funasr-sensevoice` (ggml +
+Vulkan), not Voxtype and not FunASR's prebuilt release tarball. `--sv-backend
+auto` tries Vulkan then CPU. `--srt` + `--vad` come from that binary (clean
+SRT on stdout).
 
 There is no test suite for the top-level script. `whisper.cpp/tests/`
 (`tests/run-tests.sh`) covers the vendored engine, not this repo's code.
@@ -111,8 +118,10 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   (qwen3.5, deepseek-r1, gpt-oss) otherwise spend the token budget on a
   hidden chain-of-thought and often return an empty translation. If an old
   Ollama rejects the field with HTTP 400, the call retries without it.
-- FunASR `llama-funasr-sensevoice --backend vulkan` currently segfaults on
-  this RX 9070 XT (upstream known issue). `--sv-backend auto` must fall
-  back to CPU and remember the failure; do not retry Vulkan every run.
-- `funasr-llamacpp/` is a downloaded runtime tree — do not commit binaries
-  or GGUF files.
+- `funasr-llamacpp/build/` is a generated CMake tree (fetches llama.cpp) —
+  never hand-edit it; regenerate with the cmake command above. Do not commit
+  `build/` or `gguf/`.
+- FunASR's official prebuilt Vulkan zip was reported crashing on RX 9070 XT
+  **Windows**. A local Linux RADV build can still work; do not skip compiling
+  because of that Windows note. `--sv-backend auto` still falls back to CPU
+  if Vulkan actually segfaults.

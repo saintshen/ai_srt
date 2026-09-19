@@ -15,5 +15,7 @@ whisper.cpp/build/
 whisper.cpp/build.log
 whisper.cpp/models/ggml-*.bin
 
-# FunASR llama.cpp SenseVoice runtime (prebuilt binary + GGUF)
-funasr-llamacpp/
+# FunASR llama.cpp generated build tree and GGUF weights
+funasr-llamacpp/build/
+funasr-llamacpp/gguf/
+funasr-llamacpp/.vulkan-broken
