@@ -2,11 +2,11 @@
 
 English | [中文](README.zh.md)
 
-Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (Vulkan GPU) for speech recognition (default `large-v3-turbo`), optional [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) for Japanese (and zh/en/ko/yue) via Voxtype's ONNX build, and optional local [Ollama](https://ollama.com/) for translation.
+Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (Vulkan GPU) for speech recognition (default `large-v3-turbo`), optional [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) Small via FunASR's llama.cpp/ggml runtime for Japanese (and zh/en/ko/yue), and optional local [Ollama](https://ollama.com/) for translation.
 
 Default is transcribe-only. Whisper auto-detects the source language. Pass `--to` to translate. Translation is offline by default (`qwen3.5`); `--engine trans` uses Google and sends text over the network.
 
-The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice reuses a Voxtype ONNX binary already on the machine (`voxtype-onnx-avx512`).
+The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice downloads FunASR's `llama-funasr-sensevoice` binary and GGUF weights on first use.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ python3 gen_srt.py /path/to/video.mp4
 # pin the source language
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
-# Japanese via SenseVoice (FunASR model, Voxtype ONNX + Silero VAD timestamps)
+# Japanese via SenseVoice (FunASR llama.cpp/ggml; Vulkan if it works, else CPU)
 python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
 
 # translate to Chinese (bilingual by default: translation + original)

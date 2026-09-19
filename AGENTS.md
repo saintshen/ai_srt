@@ -2,8 +2,8 @@
 
 A personal offline subtitle generator: local `whisper.cpp` (Vulkan backend)
 does speech recognition (default `large-v3-turbo`), optional SenseVoice
-(FunASR, via Voxtype ONNX) for Japanese / zh/en/ja/ko/yue, and local Ollama
-translates when asked. `whisper.cpp/`
+Small via FunASR llama.cpp/ggml for Japanese / zh/en/ja/ko/yue, and local
+Ollama translates when asked. `whisper.cpp/`
 is a vendored upstream clone (has its own build system and its own
 `AGENTS.md` contribution policy — that policy is for upstream PRs, not
 relevant here since we only consume its prebuilt binary).
@@ -57,12 +57,13 @@ Output is written next to the input: `video.<src>.srt` (transcribe) or
 If `~/.local/share/voxtype/models/ggml-large-v3-turbo.bin` already exists,
 `--model large-v3-turbo` symlinks that file instead of downloading again.
 
-`--asr sensevoice` is for Japanese (also zh/en/ko/yue). It does **not** use
-the Vulkan `voxtype` binary (that build has no SenseVoice). It calls
-`/usr/lib/voxtype/voxtype-onnx-avx512` (fallback: `voxtype-onnx-avx2`) on
-Silero VAD clips so the SRT still has timestamps. VAD for this path must
-run on CPU: `whisper-vad-speech-segments --use-gpu` aborts on this AMD
-Vulkan setup.
+`--asr sensevoice` is for Japanese (also zh/en/ko/yue). It uses FunASR's
+prebuilt `llama-funasr-sensevoice` (ggml/llama.cpp), not Voxtype. First use
+downloads the Linux Vulkan tarball plus `sensevoice-small-q8.gguf` and
+`fsmn-vad.gguf` into `funasr-llamacpp/` (gitignored). `--sv-backend auto`
+tries Vulkan then CPU; this RX 9070 XT currently segfaults on the Vulkan
+build, so the script records `funasr-llamacpp/.vulkan-broken` and retries
+CPU. `--srt` + `--vad` come from the FunASR binary (clean SRT on stdout).
 
 There is no test suite for the top-level script. `whisper.cpp/tests/`
 (`tests/run-tests.sh`) covers the vendored engine, not this repo's code.
@@ -84,8 +85,9 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
 - Default Ollama model: `qwen3.5` for every language pair. Override with
   `--ollama-model`.
 - Default Whisper model: `large-v3-turbo`. ASR backend is `--asr whisper`
-  (default) or `--asr sensevoice`. `--engine` remains the *translation*
-  engine (`ollama` / `trans`).
+  (default) or `--asr sensevoice` (FunASR llama.cpp SenseVoice). `--engine`
+  remains the *translation* engine (`ollama` / `trans`). Do not shell out
+  to `voxtype` for ASR.
 
 ## Pitfalls
 
@@ -109,10 +111,8 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   (qwen3.5, deepseek-r1, gpt-oss) otherwise spend the token budget on a
   hidden chain-of-thought and often return an empty translation. If an old
   Ollama rejects the field with HTTP 400, the call retries without it.
-- Do not call `whisper-vad-speech-segments --use-gpu` on this AMD Vulkan
-  setup; it aborts. The SenseVoice path always runs that helper on CPU.
-- `/usr/bin/voxtype` is the Vulkan build and cannot run SenseVoice. The
-  SenseVoice path must use `voxtype-onnx-avx512` (or `voxtype-onnx-avx2`).
-- Voxtype `transcribe` prints load/INFO logs (sometimes localized, sometimes
-  with ANSI color) on stdout. Always invoke it with `-q`, strip ANSI, and
-  drop log lines before treating leftover text as the cue.
+- FunASR `llama-funasr-sensevoice --backend vulkan` currently segfaults on
+  this RX 9070 XT (upstream known issue). `--sv-backend auto` must fall
+  back to CPU and remember the failure; do not retry Vulkan every run.
+- `funasr-llamacpp/` is a downloaded runtime tree — do not commit binaries
+  or GGUF files.

@@ -2,12 +2,14 @@
 """
 Generate subtitles from video or audio: local whisper.cpp (Vulkan GPU) for
 speech recognition (default model large-v3-turbo), optional SenseVoice
-(FunASR, via Voxtype ONNX) for Japanese sources, and optional local Ollama
-or translate-shell for translation.
+Small via FunASR's llama.cpp/ggml runtime (Vulkan when it works, else CPU)
+for Japanese / zh/en/ja/ko/yue, and optional local Ollama or translate-shell
+for translation.
 
 Any ffmpeg-readable file works. Default is transcribe-only (no translation);
 Whisper auto-detects the source language, override with --from. Pass --to to
-translate. For Japanese video, --asr sensevoice uses SenseVoice Small.
+translate. For Japanese video, --asr sensevoice uses SenseVoice Small
+(FunASR llama.cpp, not Voxtype).
 
 Translation engines (--engine):
     ollama (default): fully offline, qwen3.5 with a generic translation prompt.
@@ -38,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -46,11 +49,28 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WHISPER_CPP_DIR = ROOT / "whisper.cpp"
 WHISPER_CLI = WHISPER_CPP_DIR / "build" / "bin" / "whisper-cli"
-WHISPER_VAD_CLI = WHISPER_CPP_DIR / "build" / "bin" / "whisper-vad-speech-segments"
 MODELS_DIR = WHISPER_CPP_DIR / "models"
 VAD_MODEL = MODELS_DIR / "ggml-silero-v6.2.0.bin"
 VOXTYPE_TURBO = Path.home() / ".local/share/voxtype/models/ggml-large-v3-turbo.bin"
-VOXTYPE_LIB = Path("/usr/lib/voxtype")
+
+FUNASR_DIR = ROOT / "funasr-llamacpp"
+FUNASR_BIN = FUNASR_DIR / "llama-funasr-sensevoice"
+FUNASR_GGUF_DIR = FUNASR_DIR / "gguf"
+FUNASR_MODEL = FUNASR_GGUF_DIR / "sensevoice-small-q8.gguf"
+FUNASR_VAD = FUNASR_GGUF_DIR / "fsmn-vad.gguf"
+FUNASR_VULKAN_MARKER = FUNASR_DIR / ".vulkan-broken"
+FUNASR_RELEASE = "runtime-llamacpp-v0.2.1"
+FUNASR_TARBALL_URL = (
+    "https://github.com/modelscope/FunASR/releases/download/"
+    f"{FUNASR_RELEASE}/funasr-llamacpp-linux-x64-vulkan.tar.gz"
+)
+FUNASR_MODEL_URL = (
+    "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/main/"
+    "sensevoice-small-q8.gguf"
+)
+FUNASR_VAD_URL = (
+    "https://huggingface.co/FunAudioLLM/fsmn-vad-GGUF/resolve/main/fsmn-vad.gguf"
+)
 
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
@@ -121,17 +141,10 @@ SRT_BLOCK_RE = re.compile(
     r"\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s*(.*)"
 )
 MUSIC_PLACEHOLDER_RE = re.compile(r"^[\(（][^)）]*[\)）]$|^[♪\s]+$")
-VAD_SEGMENT_RE = re.compile(
-    r"Speech segment\s+\d+:\s+start\s*=\s*([0-9.]+),\s*end\s*=\s*([0-9.]+)"
-)
 SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
 SENSEVOICE_LANG_TAG_RE = re.compile(r"<\|(zh|en|ja|ko|yue)\|>")
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-# ESC often lost by the time text hits an SRT file, leaving "[32m INFO[0m"
-ANSI_SGR_RE = re.compile(r"\[(?:\d{1,3};)*\d{1,3}m")
-ISO_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
-VOXTYPE_COMPLETED_QUOTE_RE = re.compile(
-    r"(?:transcription completed|转录完成)[^\"「]*[\"「](.+?)[\"」]"
+SRT_TS_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
 
 
@@ -396,213 +409,156 @@ def transcribe(wav_path: Path, model_path: Path, language: str,
     return segments, detected
 
 
-def wav_duration_seconds(wav_path: Path) -> float:
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nw=1:nk=1",
-            str(wav_path),
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        sys.exit(f"ffprobe failed:\n{result.stderr.strip()[-2000:]}")
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        sys.exit(f"ffprobe returned no duration for {wav_path}")
+def download_file(url: str, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    print(f"    downloading {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "ai_srt"})
+    with urllib.request.urlopen(req, timeout=600) as resp, open(tmp, "wb") as out:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    tmp.replace(dest)
 
 
-def find_sensevoice_bin() -> Path:
-    for name in ("voxtype-onnx-avx512", "voxtype-onnx-avx2"):
-        candidate = VOXTYPE_LIB / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    sys.exit(
-        "SenseVoice needs a Voxtype ONNX binary (voxtype-onnx-avx512 or "
-        "voxtype-onnx-avx2) under /usr/lib/voxtype. The default Vulkan "
-        "voxtype binary is not compiled with SenseVoice."
-    )
+def ensure_funasr_runtime():
+    """Fetch FunASR llama.cpp SenseVoice binary + GGUF weights if missing."""
+    if not FUNASR_BIN.is_file():
+        tarball = FUNASR_DIR / "funasr-llamacpp-linux-x64-vulkan.tar.gz"
+        download_file(FUNASR_TARBALL_URL, tarball)
+        print(f"    extracting {tarball.name}")
+        with tarfile.open(tarball, "r:gz") as tar:
+            member = None
+            for m in tar.getmembers():
+                name = Path(m.name).name
+                if name == "llama-funasr-sensevoice" and m.isfile():
+                    member = m
+                    break
+            if member is None:
+                sys.exit(f"llama-funasr-sensevoice missing from {tarball}")
+            member.name = "llama-funasr-sensevoice"
+            tar.extract(member, path=FUNASR_DIR)
+        FUNASR_BIN.chmod(0o755)
+        tarball.unlink(missing_ok=True)
+    if not FUNASR_MODEL.is_file():
+        download_file(FUNASR_MODEL_URL, FUNASR_MODEL)
+    if not FUNASR_VAD.is_file():
+        download_file(FUNASR_VAD_URL, FUNASR_VAD)
 
 
 def strip_sensevoice_text(text: str) -> str:
     return SENSEVOICE_TAG_RE.sub("", text).strip()
 
 
-def _voxtype_noise_line(s: str) -> bool:
-    if s.startswith((
-        "Loading audio", "Audio format", "Processing ",
-        "正在从", "使用全精度", "未找到",
-    )):
-        return True
-    if re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG)\b", s):
-        return True
-    if "SenseVoice" in s and any(
-        token in s for token in (
-            "加载", "转录", "模型", "Loading", "loaded",
-            "transcription completed", "full-precision", "int8.onnx",
-        )
-    ):
-        return True
-    return False
-
-
-def parse_voxtype_transcript(stdout: str) -> str:
-    """Keep only the spoken text.
-
-    Voxtype may dump ANSI-colored, localized INFO logs on the same stream,
-    often concatenated onto one line with the transcript after
-    `转录完成...："..."`.
-    """
-    text = ANSI_ESCAPE_RE.sub("", stdout or "")
-    text = ANSI_SGR_RE.sub("", text)
-
-    quoted = []
-    for m in VOXTYPE_COMPLETED_QUOTE_RE.finditer(text):
-        q = m.group(1).strip()
-        if q and not q.endswith("..."):
-            quoted.append(q)
-
-    # Break concatenated logs so leftover spoken text can be kept.
-    split = ISO_TIMESTAMP_RE.sub("\n", text)
-    leftover = []
-    for line in split.splitlines():
-        s = line.strip(" \t:-")
-        s = re.sub(r'^[\"「]|[\"」]$', "", s).strip()
-        if not s or _voxtype_noise_line(s):
+def parse_srt_cues(text: str):
+    """Parse standard SRT from llama-funasr-sensevoice --srt stdout."""
+    cues = []
+    for block in re.split(r"\n\s*\n", (text or "").strip()):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
             continue
-        leftover.append(s)
+        ts_line = lines[0]
+        body_from = 1
+        if not SRT_TS_RE.search(ts_line) and len(lines) >= 2:
+            ts_line = lines[1]
+            body_from = 2
+        m = SRT_TS_RE.search(ts_line)
+        if not m:
+            continue
+        start = ts_to_seconds(*m.groups()[:4])
+        end = ts_to_seconds(*m.groups()[4:])
+        body = " ".join(lines[body_from:]).strip()
+        body = strip_sensevoice_text(body)
+        if body:
+            cues.append((start, end, body))
+    return cues
 
-    unique = []
-    seen = set()
-    for s in quoted + leftover:
-        if s not in seen:
-            seen.add(s)
-            unique.append(s)
-    return " ".join(unique).strip()
+
+def pick_sensevoice_backend(requested: str) -> str:
+    if requested in ("cpu", "vulkan"):
+        return requested
+    if FUNASR_VULKAN_MARKER.exists():
+        return "cpu"
+    return "vulkan"
 
 
-def vad_speech_segments(wav_path: Path, vad_threshold: float,
-                        vad_min_silence_ms: int, vad_max_speech_s: float):
-    """Return [(start_s, end_s), ...]. Standalone VAD must run on CPU; --use-gpu
-    aborts on this machine's Vulkan backend."""
-    if not WHISPER_VAD_CLI.is_file():
-        sys.exit(f"VAD helper missing: {WHISPER_VAD_CLI}")
-    if not VAD_MODEL.exists():
-        sys.exit(f"VAD model missing: {VAD_MODEL}")
+def run_funasr_sensevoice(wav_path: Path, backend: str, use_vad: bool,
+                          vad_max_speech_s: float):
     cmd = [
-        str(WHISPER_VAD_CLI),
-        "--file", str(wav_path),
-        "--vad-model", str(VAD_MODEL),
-        "--vad-threshold", str(vad_threshold),
-        "--vad-min-silence-duration-ms", str(vad_min_silence_ms),
-        "--vad-max-speech-duration-s", str(vad_max_speech_s),
-        "--no-prints",
+        str(FUNASR_BIN),
+        "-m", str(FUNASR_MODEL),
+        "-a", str(wav_path),
+        "--backend", backend,
+        "--srt",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=False, env=whisper_env())
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
-        sys.exit(f"whisper-vad-speech-segments failed:\n{stderr[-2000:]}")
-    spans = []
-    for m in VAD_SEGMENT_RE.finditer(stdout):
-        # Tool prints centiseconds (start = 32.00 → 0.32s).
-        start = float(m.group(1)) / 100.0
-        end = float(m.group(2)) / 100.0
-        if end - start >= 0.15:
-            spans.append((start, end))
-    return spans
-
-
-def extract_wav_clip(src_wav: Path, dst_wav: Path, start: float, end: float):
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src_wav),
-        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-        "-ar", "16000", "-ac", "1",
-        str(dst_wav),
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        err = result.stderr.decode("utf-8", errors="replace").strip()
-        sys.exit(f"ffmpeg clip failed:\n{err[-2000:]}")
-
-
-def transcribe_sensevoice_clip(bin_path: Path, wav_path: Path, language: str):
-    cmd = [str(bin_path), "-q"]
-    if language in SENSEVOICE_LANGS:
-        cmd += ["--language", language]
-    cmd += ["transcribe", "--engine", "sensevoice", str(wav_path)]
-    env = os.environ.copy()
-    env["NO_COLOR"] = "1"
-    env["TERM"] = "dumb"
-    result = subprocess.run(
-        cmd, capture_output=True, text=False, timeout=180, env=env,
-    )
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
-        err = (stderr or stdout).strip()
-        sys.exit(f"SenseVoice (Voxtype ONNX) failed:\n{err[-2000:]}")
-    raw = parse_voxtype_transcript(stdout)
-    return strip_sensevoice_text(raw), raw
-
-
-def transcribe_sensevoice(wav_path: Path, language: str, tmp_dir: Path,
-                          use_vad: bool = True, suppress_music: bool = True,
-                          vad_threshold: float = 0.5, vad_min_silence_ms: int = 100,
-                          vad_max_speech_s: float = DEFAULT_VAD_MAX_SPEECH_S,
-                          stage: str = "[2/3]"):
-    """SenseVoice Small (FunASR) via Voxtype ONNX. Silero VAD supplies SRT times."""
-    bin_path = find_sensevoice_bin()
-    sv_lang = language if language in SENSEVOICE_LANGS else "auto"
-    print(f"{stage} transcribing with SenseVoice Small (Voxtype ONNX, CPU) "
-          f"language={sv_lang}...")
-    print(f"    binary: {bin_path}")
-    if language not in ("auto", "unk") and language not in SENSEVOICE_LANGS:
-        print(f"    warning: SenseVoice covers zh/en/ja/ko/yue; "
-              f"'{language}' will use auto")
-        sv_lang = "auto"
-
     if use_vad:
-        spans = vad_speech_segments(
-            wav_path, vad_threshold, vad_min_silence_ms, vad_max_speech_s,
-        )
-        print(f"    VAD (CPU) found {len(spans)} speech spans "
-              f"(threshold={vad_threshold}, min silence={vad_min_silence_ms}ms, "
-              f"max speech={vad_max_speech_s}s)")
-    else:
-        spans = [(0.0, wav_duration_seconds(wav_path))]
-        print("    VAD disabled; transcribing the full file as one cue")
+        cmd += [
+            "--vad", str(FUNASR_VAD),
+            "--vad-maxseg", str(int(vad_max_speech_s * 1000)),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=False, timeout=7200)
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    return result.returncode, stdout, stderr
 
-    if not spans:
-        print("    no speech detected")
-        detected = language if language != "auto" else "unk"
-        return [], detected
+
+def transcribe_sensevoice(wav_path: Path, language: str,
+                          use_vad: bool = True, suppress_music: bool = True,
+                          vad_max_speech_s: float = DEFAULT_VAD_MAX_SPEECH_S,
+                          backend: str = "auto",
+                          stage: str = "[2/3]"):
+    """SenseVoice Small via FunASR llama.cpp/ggml. Tries Vulkan, falls back to CPU."""
+    ensure_funasr_runtime()
+    if language not in ("auto", "unk") and language not in SENSEVOICE_LANGS:
+        print(f"    warning: SenseVoice covers zh/en/ja/ko/yue; '{language}' "
+              f"will still run (no language flag on this binary)")
+
+    chosen = pick_sensevoice_backend(backend)
+    print(f"{stage} transcribing with SenseVoice Small "
+          f"(FunASR llama.cpp/ggml, backend={chosen})...")
+    print(f"    binary: {FUNASR_BIN}")
+    print(f"    model:  {FUNASR_MODEL.name}")
+
+    code, stdout, stderr = run_funasr_sensevoice(
+        wav_path, chosen, use_vad, vad_max_speech_s,
+    )
+    if code != 0 and chosen == "vulkan" and backend == "auto":
+        print("    Vulkan SenseVoice failed "
+              f"(exit {code}); falling back to CPU. "
+              "This is expected on some AMD GPUs (e.g. RX 9070 XT).")
+        FUNASR_VULKAN_MARKER.write_text("vulkan backend failed\n", encoding="utf-8")
+        chosen = "cpu"
+        print("    retrying with backend=cpu ...")
+        code, stdout, stderr = run_funasr_sensevoice(
+            wav_path, chosen, use_vad, vad_max_speech_s,
+        )
+    if code != 0:
+        sys.exit(
+            f"llama-funasr-sensevoice failed (backend={chosen}, exit {code}):\n"
+            f"{stderr[-2000:]}"
+        )
+
+    segments = parse_srt_cues(stdout)
+    skipped = 0
+    if suppress_music:
+        kept = []
+        for start, end, text in segments:
+            if MUSIC_PLACEHOLDER_RE.match(text):
+                skipped += 1
+                continue
+            kept.append((start, end, text))
+        segments = kept
 
     detected = language if language != "auto" else "unk"
-    segments = []
-    skipped = 0
-    clip_dir = tmp_dir / "sv_clips"
-    clip_dir.mkdir(exist_ok=True)
-    for i, (start, end) in enumerate(spans):
-        clip = clip_dir / f"{i:04d}.wav"
-        extract_wav_clip(wav_path, clip, start, end)
-        text, raw = transcribe_sensevoice_clip(bin_path, clip, sv_lang)
-        if language == "auto" and detected == "unk":
-            m = SENSEVOICE_LANG_TAG_RE.search(raw)
-            if m:
-                detected = m.group(1)
-                print(f"    detected source language: {detected} ({lang_display(detected)})")
-        if not text:
-            skipped += 1
-            continue
-        if suppress_music and MUSIC_PLACEHOLDER_RE.match(text):
-            skipped += 1
-            continue
-        segments.append((start, end, text))
-        print(f"    [{i+1}/{len(spans)}] {start:.1f}-{end:.1f}s: {len(text)} chars")
-    extra = f" (skipped {skipped})" if skipped else ""
+    if language == "auto":
+        m = SENSEVOICE_LANG_TAG_RE.search(stdout + "\n" + stderr)
+        if m:
+            detected = m.group(1)
+            print(f"    detected source language: {detected} ({lang_display(detected)})")
+
+    extra = f" (filtered {skipped} non-speech placeholders)" if skipped else ""
     print(f"    {len(segments)} segments{extra}")
     return segments, detected
 
@@ -682,8 +638,11 @@ def main():
                     help="target language. Omit to transcribe only. Common: zh/en/ja")
     ap.add_argument("--asr", choices=["whisper", "sensevoice"], default="whisper",
                     help="speech recognition: whisper=whisper.cpp Vulkan (default), "
-                         "sensevoice=SenseVoice Small via Voxtype ONNX (Japanese / "
-                         "zh/en/ja/ko/yue, CPU)")
+                         "sensevoice=SenseVoice Small via FunASR llama.cpp/ggml "
+                         "(Japanese / zh/en/ja/ko/yue)")
+    ap.add_argument("--sv-backend", choices=["auto", "cpu", "vulkan"], default="auto",
+                    help="SenseVoice compute backend. auto tries Vulkan then CPU "
+                         "(RX 9070 XT currently crashes on Vulkan and falls back)")
     ap.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
                     help="Whisper ASR model: tiny/base/small/medium/large-v3/"
                          "large-v3-turbo (default large-v3-turbo; ignored with "
@@ -754,7 +713,13 @@ def main():
         )
         if args.asr == "sensevoice":
             segments, detected_lang = transcribe_sensevoice(
-                wav_path, tmp_dir=tmp_dir, **asr_kwargs,
+                wav_path,
+                language=args.src_lang,
+                use_vad=not args.no_vad,
+                suppress_music=not args.no_suppress_music,
+                vad_max_speech_s=args.vad_max_speech,
+                backend=args.sv_backend,
+                stage=f"[2/{n_stages}]",
             )
         else:
             segments, detected_lang = transcribe(
