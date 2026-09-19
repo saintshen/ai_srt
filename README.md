@@ -65,6 +65,8 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
+ASR is written to `video.<src>.srt` as soon as recognition finishes (e.g. `video.ja.srt`). Translation then writes `video.<tgt>.srt`. If Ollama times out, rerun the same command: existing `.ja.srt` is reused and a partial `.zh.srt` resumes from the next cue. Completed outputs are skipped unless you pass `--force`.
+
 Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
 
 ## SenseVoice

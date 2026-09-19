@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -69,6 +70,7 @@ FUNASR_VAD_URL = (
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
 DEFAULT_VAD_MAX_SPEECH_S = 8.0
+OLLAMA_RETRIES = 3
 SENSEVOICE_LANGS = {"zh", "en", "ja", "ko", "yue"}
 
 # whisper.cpp language codes → English names (aligned with src/whisper.cpp g_lang)
@@ -244,7 +246,8 @@ def ensure_ollama_model(name: str):
 
 def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
                     ollama_url: str = "http://localhost:11434/api/generate",
-                    options=None, timeout: int = 180) -> dict:
+                    options=None, timeout: int = 180,
+                    retries: int = OLLAMA_RETRIES) -> dict:
     """POST /api/generate. Always send think=false so reasoning models emit
     the translation instead of burning the token budget on a hidden CoT."""
     payload = {
@@ -265,23 +268,37 @@ def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
 
-    try:
-        return _post(payload)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        # Older Ollama / models that reject `think` return HTTP 400; retry once.
-        if e.code == 400 and "think" in payload:
-            payload.pop("think", None)
-            try:
-                return _post(payload)
-            except urllib.error.HTTPError as e2:
-                err_body = e2.read().decode("utf-8", errors="replace")
+    delay = 2
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return _post(payload)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            # Older Ollama / models that reject `think` return HTTP 400; retry once.
+            if e.code == 400 and "think" in payload:
+                payload.pop("think", None)
+                try:
+                    return _post(payload)
+                except urllib.error.HTTPError as e2:
+                    err_body = e2.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Ollama request failed HTTP {e2.code}: {err_body[:500]}"
+                    ) from e2
+            raise RuntimeError(
+                f"Ollama request failed HTTP {e.code}: {err_body[:500]}"
+            ) from e
+        except (TimeoutError, urllib.error.URLError, ConnectionError, OSError) as e:
+            last_err = e
+            if attempt == retries:
                 raise RuntimeError(
-                    f"Ollama request failed HTTP {e2.code}: {err_body[:500]}"
-                ) from e2
-        raise RuntimeError(
-            f"Ollama request failed HTTP {e.code}: {err_body[:500]}"
-        ) from e
+                    f"Ollama failed after {retries} tries ({type(e).__name__}: {e})"
+                ) from e
+            print(f"    Ollama {type(e).__name__}: {e}; "
+                  f"retry {attempt}/{retries} in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    raise RuntimeError(f"Ollama failed: {last_err}") from last_err
 
 
 def whisper_env() -> dict:
@@ -437,9 +454,9 @@ def strip_sensevoice_text(text: str) -> str:
     return SENSEVOICE_TAG_RE.sub("", text).strip()
 
 
-def parse_srt_cues(text: str):
-    """Parse standard SRT from llama-funasr-sensevoice --srt stdout."""
-    cues = []
+def parse_srt_blocks(text: str):
+    """Parse SRT into (start, end, body_lines). Incomplete trailing blocks are dropped."""
+    blocks = []
     for block in re.split(r"\n\s*\n", (text or "").strip()):
         lines = [ln for ln in block.splitlines() if ln.strip()]
         if len(lines) < 2:
@@ -454,11 +471,51 @@ def parse_srt_cues(text: str):
             continue
         start = ts_to_seconds(*m.groups()[:4])
         end = ts_to_seconds(*m.groups()[4:])
-        body = " ".join(lines[body_from:]).strip()
-        body = strip_sensevoice_text(body)
+        body = lines[body_from:]
         if body:
-            cues.append((start, end, body))
+            blocks.append((start, end, body))
+    return blocks
+
+
+def parse_srt_cues(text: str):
+    """Parse standard SRT from llama-funasr-sensevoice --srt stdout."""
+    cues = []
+    for start, end, body in parse_srt_blocks(text):
+        joined = strip_sensevoice_text(" ".join(body))
+        if joined:
+            cues.append((start, end, joined))
     return cues
+
+
+def load_srt_cues(path: Path):
+    return parse_srt_cues(path.read_text(encoding="utf-8"))
+
+
+def load_srt_blocks(path: Path):
+    return parse_srt_blocks(path.read_text(encoding="utf-8"))
+
+
+def media_srt_path(media_path: Path, tag: str) -> Path:
+    return Path(str(media_path.with_suffix("")) + f".{tag}.srt")
+
+
+def write_srt_cue(fh, idx: int, start: float, end: float, body_lines):
+    fh.write(f"{idx}\n")
+    fh.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n")
+    for line in body_lines:
+        fh.write(f"{line}\n")
+    fh.write("\n")
+    fh.flush()
+
+
+def write_srt_file(path: Path, cues):
+    """cues: iterable of (start, end, body_lines_or_str)."""
+    with open(path, "w", encoding="utf-8") as fh:
+        for idx, item in enumerate(cues, 1):
+            start, end, body = item
+            if isinstance(body, str):
+                body = [body]
+            write_srt_cue(fh, idx, start, end, body)
 
 
 def pick_sensevoice_backend(requested: str) -> str:
@@ -655,6 +712,8 @@ def main():
     ap.add_argument("--engine", choices=["ollama", "trans"], default="ollama",
                     help="translation engine: ollama=local offline (default), "
                          "trans=translate-shell/Google (faster, sends text online)")
+    ap.add_argument("--force", action="store_true",
+                    help="redo ASR and translation even if sidecar .srt files exist")
     ap.add_argument("--list-langs", action="store_true",
                     help="list Whisper language codes and exit")
     ap.add_argument("--list-models", action="store_true",
@@ -676,80 +735,118 @@ def main():
         sys.exit(f"file not found: {media_path}")
 
     do_translate = args.tgt_lang is not None
-    n_stages = 3 if do_translate else 2
+    src_hint = args.src_lang
+    src_srt_guess = None
+    if src_hint not in ("auto", "unk"):
+        src_srt_guess = media_srt_path(media_path, src_hint)
+    reuse_asr = (
+        not args.force
+        and src_srt_guess is not None
+        and src_srt_guess.is_file()
+        and src_srt_guess.stat().st_size > 0
+    )
 
-    model_path = None
-    if args.asr == "whisper":
-        model_path = ensure_model(args.model)
+    if reuse_asr:
+        segments = load_srt_cues(src_srt_guess)
+        if not segments:
+            reuse_asr = False
+        else:
+            src_lang = src_hint
+            print(f"    using existing transcription {src_srt_guess} "
+                  f"({len(segments)} cues)")
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp_dir = Path(td)
-        wav_path = tmp_dir / "audio.wav"
-        extract_audio(media_path, wav_path, stage=f"[1/{n_stages}]")
-        asr_kwargs = dict(
-            language=args.src_lang,
-            use_vad=not args.no_vad,
-            suppress_music=not args.no_suppress_music,
-            vad_threshold=args.vad_threshold,
-            vad_min_silence_ms=args.vad_min_silence,
-            vad_max_speech_s=args.vad_max_speech,
-            stage=f"[2/{n_stages}]",
-        )
-        if args.asr == "sensevoice":
-            segments, detected_lang = transcribe_sensevoice(
-                wav_path,
+    if not reuse_asr:
+        n_stages = 3 if do_translate else 2
+        model_path = None
+        if args.asr == "whisper":
+            model_path = ensure_model(args.model)
+        with tempfile.TemporaryDirectory() as td:
+            wav_path = Path(td) / "audio.wav"
+            extract_audio(media_path, wav_path, stage=f"[1/{n_stages}]")
+            asr_kwargs = dict(
                 language=args.src_lang,
                 use_vad=not args.no_vad,
                 suppress_music=not args.no_suppress_music,
+                vad_threshold=args.vad_threshold,
+                vad_min_silence_ms=args.vad_min_silence,
                 vad_max_speech_s=args.vad_max_speech,
-                backend=args.sv_backend,
                 stage=f"[2/{n_stages}]",
             )
-        else:
-            segments, detected_lang = transcribe(
-                wav_path, model_path, **asr_kwargs,
-            )
-        src_lang = detected_lang if args.src_lang == "auto" else args.src_lang
-        actually_translate = do_translate and src_lang != args.tgt_lang
-        if do_translate and not actually_translate:
-            print(f"    source and target are the same ({src_lang}), skipping translation")
-
-        out_tag = args.tgt_lang if actually_translate else src_lang
-        out_srt = Path(str(media_path.with_suffix("")) + f".{out_tag}.srt")
-
-        print(f"[{n_stages}/{n_stages}] writing subtitles: {out_srt}")
-        ollama_model = args.ollama_model
-        if actually_translate and args.engine == "ollama":
-            if not ollama_model:
-                ollama_model = DEFAULT_OLLAMA_MODEL
-            ensure_ollama_model(ollama_model)
-            print(f"    translation model: {ollama_model}")
-            warmup_ollama(ollama_model, keep_alive=args.keep_alive)
-        elif actually_translate and args.engine == "trans":
-            print("    using trans (translate-shell/Google); text will be sent to Google")
-
-        with open(out_srt, "w", encoding="utf-8") as f:
-            idx = 1
-            for start, end, src_text in segments:
-                if not actually_translate:
-                    f.write(f"{idx}\n")
-                    f.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n")
-                    f.write(f"{src_text}\n\n")
-                    print(f"  [{idx}] {start:.1f}-{end:.1f}: (transcribed, {len(src_text)} chars)")
-                    idx += 1
-                    continue
-                tgt_text = translate_text(
-                    src_text, src_lang, args.tgt_lang, args.engine,
-                    ollama_model=ollama_model, keep_alive=args.keep_alive,
+            if args.asr == "sensevoice":
+                segments, detected_lang = transcribe_sensevoice(
+                    wav_path,
+                    language=args.src_lang,
+                    use_vad=not args.no_vad,
+                    suppress_music=not args.no_suppress_music,
+                    vad_max_speech_s=args.vad_max_speech,
+                    backend=args.sv_backend,
+                    stage=f"[2/{n_stages}]",
                 )
-                f.write(f"{idx}\n")
-                f.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n")
-                if args.bilingual:
-                    f.write(f"{tgt_text}\n{src_text}\n\n")
-                else:
-                    f.write(f"{tgt_text}\n\n")
-                print(f"  [{idx}] {start:.1f}-{end:.1f}: (translated)")
-                idx += 1
+            else:
+                segments, detected_lang = transcribe(
+                    wav_path, model_path, **asr_kwargs,
+                )
+        src_lang = detected_lang if args.src_lang == "auto" else args.src_lang
+        src_srt = media_srt_path(media_path, src_lang)
+        write_srt_file(src_srt, segments)
+        print(f"    wrote transcription {src_srt}")
+    else:
+        src_srt = src_srt_guess
+        n_stages = 2 if do_translate else 1
+
+    actually_translate = do_translate and src_lang != args.tgt_lang
+    if do_translate and not actually_translate:
+        print(f"    source and target are the same ({src_lang}), skipping translation")
+
+    out_tag = args.tgt_lang if actually_translate else src_lang
+    out_srt = media_srt_path(media_path, out_tag)
+
+    if not actually_translate:
+        if reuse_asr and not args.force:
+            print(f"done. already have {src_srt}")
+            return
+        print(f"[{n_stages}/{n_stages}] writing subtitles: {out_srt}")
+        write_srt_file(out_srt, segments)
+        print(f"done. subtitles saved to: {out_srt}")
+        return
+
+    existing = []
+    if not args.force and out_srt.is_file() and out_srt.stat().st_size > 0:
+        existing = load_srt_blocks(out_srt)
+        if len(existing) >= len(segments):
+            print(f"skip: {out_srt} already has {len(existing)} cues")
+            print(f"done. subtitles saved to: {out_srt}")
+            return
+        if existing:
+            print(f"    resuming translation at cue {len(existing) + 1}/"
+                  f"{len(segments)} ({out_srt})")
+
+    print(f"[{n_stages}/{n_stages}] writing subtitles: {out_srt}")
+    ollama_model = args.ollama_model
+    if args.engine == "ollama":
+        if not ollama_model:
+            ollama_model = DEFAULT_OLLAMA_MODEL
+        ensure_ollama_model(ollama_model)
+        print(f"    translation model: {ollama_model}")
+        warmup_ollama(ollama_model, keep_alive=args.keep_alive)
+    else:
+        print("    using trans (translate-shell/Google); text will be sent to Google")
+
+    n_done = len(existing)
+    with open(out_srt, "w", encoding="utf-8") as f:
+        idx = 1
+        for start, end, body in existing:
+            write_srt_cue(f, idx, start, end, body)
+            idx += 1
+        for start, end, src_text in segments[n_done:]:
+            tgt_text = translate_text(
+                src_text, src_lang, args.tgt_lang, args.engine,
+                ollama_model=ollama_model, keep_alive=args.keep_alive,
+            )
+            body = [tgt_text, src_text] if args.bilingual else [tgt_text]
+            write_srt_cue(f, idx, start, end, body)
+            print(f"  [{idx}] {start:.1f}-{end:.1f}: (translated)")
+            idx += 1
 
     print(f"done. subtitles saved to: {out_srt}")
 

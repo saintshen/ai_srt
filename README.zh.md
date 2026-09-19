@@ -65,6 +65,8 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
+识别一结束就会写成 `video.<源语言>.srt`（例如 `video.ja.srt`），翻译再写 `video.<目标语言>.srt`。Ollama 超时后用同一条命令重跑即可：已有的 `.ja.srt` 会复用，不完整的 `.zh.srt` 从下一条继续。已经完成的输出会跳过，除非加 `--force`。
+
 任意 ffmpeg 能读的视频或音频都可以。翻译模式下输出是 `video.<目标语言>.srt`。
 
 ## SenseVoice
