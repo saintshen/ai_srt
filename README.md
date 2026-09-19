@@ -6,7 +6,7 @@ Offline subtitle generator: [whisper.cpp](https://github.com/ggml-org/whisper.cp
 
 Default is transcribe-only. Whisper auto-detects the source language. Pass `--to` to translate. Translation is offline by default (`qwen3.5`); `--engine trans` uses Google and sends text over the network.
 
-The top-level script is Python 3 stdlib only — no `pip install`. SenseVoice uses a locally built FunASR llama.cpp binary; GGUF weights download on first use.
+The top-level script is Python 3 stdlib only — no `pip install`.
 
 ## Requirements
 
@@ -44,8 +44,10 @@ python3 gen_srt.py /path/to/video.mp4
 # pin the source language
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
-# Japanese via SenseVoice (FunASR llama.cpp/ggml; Vulkan if it works, else CPU)
+# Japanese / zh / en / ko / yue via SenseVoice (local FunASR llama.cpp + Vulkan)
 python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --asr sensevoice
+python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice --sv-backend cpu
 
 # translate to Chinese (bilingual by default: translation + original)
 python3 gen_srt.py /path/to/video.mp4 --to zh
@@ -64,6 +66,22 @@ python3 gen_srt.py --help
 ```
 
 Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
+
+## SenseVoice
+
+Default ASR is Whisper (`large-v3-turbo` on Vulkan). For Japanese — and Chinese, Cantonese, Korean, or English — you can switch to [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) Small, FunASR’s five-language model. It is a separate engine, not Voxtype: this repo vendors FunASR’s `runtime/llama.cpp` as `funasr-llamacpp/` and compiles `llama-funasr-sensevoice` with `GGML_VULKAN=ON`, same idea as whisper.cpp.
+
+`--asr` picks the recognizer; `--engine` still picks the translator (`ollama` / `trans`). `--model` is Whisper-only and is ignored with `--asr sensevoice`.
+
+```bash
+cd funasr-llamacpp
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-funasr-sensevoice
+```
+
+On first `--asr sensevoice` run, GGUF weights (`sensevoice-small-q8.gguf`, `fsmn-vad.gguf`) download into `funasr-llamacpp/gguf/`. The binary emits SRT with its own FSMN-VAD.
+
+`--sv-backend auto` (default) tries Vulkan, then CPU if Vulkan crashes. On this machine a local RADV build runs on the RX 9070 XT; FunASR’s official Windows Vulkan zip is a different binary and is not used. Force a backend with `--sv-backend vulkan` or `--sv-backend cpu`.
 
 ## License
 

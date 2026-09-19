@@ -6,7 +6,7 @@
 
 默认只识别、不翻译，源语言由 Whisper 自动检测。加上 `--to` 才会翻译。翻译默认完全离线（`qwen3.5`）；`--engine trans` 会走 Google，文本会上网。
 
-顶层脚本是纯 Python 3 标准库，不用 `pip install`。SenseVoice 使用本地编译的 FunASR llama.cpp 二进制；GGUF 权重会在首次使用时下载。
+顶层脚本是纯 Python 3 标准库，不用 `pip install`。
 
 ## 依赖
 
@@ -44,8 +44,10 @@ python3 gen_srt.py /path/to/video.mp4
 # 指定源语言
 python3 gen_srt.py /path/to/video.mp4 --from ja
 
-# 日语用 SenseVoice（FunASR llama.cpp/ggml；Vulkan 可用则用，否则 CPU）
+# 日语 / 中 / 英 / 韩 / 粤 用 SenseVoice（本地编译的 FunASR llama.cpp + Vulkan）
 python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --asr sensevoice
+python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice --sv-backend cpu
 
 # 翻译成中文（默认双语：译文 + 原文）
 python3 gen_srt.py /path/to/video.mp4 --to zh
@@ -64,6 +66,22 @@ python3 gen_srt.py --help
 ```
 
 任意 ffmpeg 能读的视频或音频都可以。翻译模式下输出是 `video.<目标语言>.srt`。
+
+## SenseVoice
+
+默认识别引擎是 Whisper（Vulkan 上的 `large-v3-turbo`）。日语，以及中文、粤语、韩语、英语，可以改用 [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) Small（FunASR 的五语种模型）。这是独立后端，不调用 Voxtype：仓库把 FunASR 的 `runtime/llama.cpp` 放在 `funasr-llamacpp/`，用 `GGML_VULKAN=ON` 本地编译 `llama-funasr-sensevoice`，方式和 whisper.cpp 一样。
+
+`--asr` 选识别器；`--engine` 仍是翻译器（`ollama` / `trans`）。`--model` 只作用于 Whisper，和 `--asr sensevoice` 无关。
+
+```bash
+cd funasr-llamacpp
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-funasr-sensevoice
+```
+
+第一次跑 `--asr sensevoice` 时，会把 GGUF 权重（`sensevoice-small-q8.gguf`、`fsmn-vad.gguf`）下到 `funasr-llamacpp/gguf/`。时间轴由二进制自带的 FSMN-VAD 切段并输出 SRT。
+
+`--sv-backend auto`（默认）先试 Vulkan，崩溃则回退 CPU。本机用 RADV 编出来的二进制可以在 RX 9070 XT 上跑 Vulkan；FunASR 官方 Windows Vulkan 预编译包是另一套东西，这里不用。也可用 `--sv-backend vulkan` 或 `--sv-backend cpu` 强制指定。
 
 ## 许可证
 
