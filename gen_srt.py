@@ -74,6 +74,8 @@ DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
 DEFAULT_VAD_MAX_SPEECH_S = 8.0
 OLLAMA_RETRIES = 3
+OLLAMA_TIMEOUT_S = 60
+OLLAMA_NUM_PREDICT = 256
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 SENSEVOICE_LANGS = {"zh", "en", "ja", "ko", "yue"}
 
@@ -250,7 +252,7 @@ def ensure_ollama_model(name: str):
 
 def ollama_generate(ollama_model: str, prompt: str, keep_alive: str = "10m",
                     ollama_url: str = "http://localhost:11434/api/generate",
-                    options=None, timeout: int = 180,
+                    options=None, timeout: int = OLLAMA_TIMEOUT_S,
                     retries: int = OLLAMA_RETRIES) -> dict:
     """POST /api/generate. Always send think=false so reasoning models emit
     the translation instead of burning the token budget on a hidden CoT."""
@@ -629,7 +631,11 @@ def translate_ollama(text: str, src: str, tgt: str, ollama_model: str,
     )
     data = ollama_generate(
         ollama_model, prompt, keep_alive=keep_alive, ollama_url=ollama_url,
-        options={"temperature": 0.2, "presence_penalty": 0},
+        options={
+            "temperature": 0.2,
+            "presence_penalty": 0,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
     )
     return (data.get("response") or "").strip()
 
@@ -808,13 +814,19 @@ def process_one(media_path: Path, args):
             write_srt_cue(f, idx, start, end, body)
             idx += 1
         for start, end, src_text in segments[n_done:]:
-            tgt_text = translate_text(
-                src_text, src_lang, args.tgt_lang, args.engine,
-                ollama_model=ollama_model, keep_alive=args.keep_alive,
-            )
+            try:
+                tgt_text = translate_text(
+                    src_text, src_lang, args.tgt_lang, args.engine,
+                    ollama_model=ollama_model, keep_alive=args.keep_alive,
+                )
+                note = "translated"
+            except RuntimeError as e:
+                print(f"    translation failed at cue {idx}: {e}")
+                tgt_text = src_text
+                note = "untranslated (Ollama failed)"
             body = [tgt_text, src_text] if args.bilingual else [tgt_text]
             write_srt_cue(f, idx, start, end, body)
-            print(f"  [{idx}] {start:.1f}-{end:.1f}: (translated)")
+            print(f"  [{idx}] {start:.1f}-{end:.1f}: ({note})")
             idx += 1
 
     if not args.keep_src_srt and src_srt != out_srt and src_srt.is_file():

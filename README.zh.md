@@ -85,6 +85,8 @@ python3 gen_srt.py /path/to/videos --from ja --to zh --asr sensevoice --no-recur
 |---|---|
 | `video.zh.srt` 条数 ≥ 日文识别条数 | **跳过**（不识别、不翻译）。多余的 `video.ja.srt` 会删掉，除非 `--keep-src-srt`。 |
 | `video.zh.srt` 不完整 | **从下一条接着译**。有 `video.ja.srt` 就复用，不重跑 ASR。 |
+
+某一条对 Ollama 超时（最多 3 次、每次 60 秒）时，该行先按原文写入，后面的句子继续译。同一条命令再跑即可接着做剩余条目。
 | 只有 `video.ja.srt` | 复用识别，只做翻译。 |
 | 都没有 | 从头识别 + 翻译。 |
 

@@ -85,6 +85,8 @@ Existing subtitles are **not overwritten** if they look complete. For `--from ja
 |---|---|
 | `video.zh.srt` has at least as many cues as the Japanese transcript | **Skip** (no ASR, no translation). Leftover `video.ja.srt` is deleted unless `--keep-src-srt`. |
 | `video.zh.srt` is partial | **Resume translation** from the next cue. Reuses `video.ja.srt` if present. |
+
+If a single cue times out against Ollama (three tries, 60s each), that line is written untranslated and the rest of the file continues. Rerun the same command to pick up remaining cues.
 | Only `video.ja.srt` | Reuse ASR, translate only. |
 | Neither | Full ASR + translation. |
 
