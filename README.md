@@ -66,11 +66,29 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
-Pass a **directory** to process every `*.mp4` / `*.mkv` / … in it and in subdirectories (sorted by path). Use `--no-recursive` for that folder only. One file failing does not skip the rest. Command line, timestamps, and all output are appended to `gen_srt.log` in that directory (override with `--log`).
+Any ffmpeg-readable video or audio works. Translate mode writes `video.<tgt>.srt` (bilingual by default: translation, then original).
 
-ASR is checkpointed to `video.<src>.srt` (e.g. `video.ja.srt`) so a crash can resume without re-recognizing. After `video.<tgt>.srt` is complete, that checkpoint is deleted — you only keep the bilingual `video.zh.srt`. Pass `--keep-src-srt` to leave the Japanese file in place. If Ollama times out, rerun the same command: an existing `.ja.srt` is reused and a partial `.zh.srt` resumes from the next cue. Completed `.zh.srt` files are skipped unless you pass `--force`. Leftover `.ja.srt` from older runs is removed on that skip.
+## Batch, skip, resume
 
-Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
+Pass a **directory** to process every `*.mp4` / `*.mkv` / `*.webm` / `*.mov` / `*.m4v` / `*.avi` in it **and subdirectories** (sorted by path). One file failing does not skip the rest.
+
+```bash
+python3 gen_srt.py /path/to/videos --from ja --to zh --asr sensevoice
+python3 gen_srt.py /path/to/videos --from ja --to zh --asr sensevoice --no-recursive
+```
+
+Command line, timestamps, and all output are appended to `gen_srt.log` in that directory (`--log PATH` to override).
+
+Existing subtitles are **not overwritten** if they look complete. For `--from ja --to zh`:
+
+| Already on disk | What happens |
+|---|---|
+| `video.zh.srt` has at least as many cues as the Japanese transcript | **Skip** (no ASR, no translation). Leftover `video.ja.srt` is deleted unless `--keep-src-srt`. |
+| `video.zh.srt` is partial | **Resume translation** from the next cue. Reuses `video.ja.srt` if present. |
+| Only `video.ja.srt` | Reuse ASR, translate only. |
+| Neither | Full ASR + translation. |
+
+`--force` redos ASR and translation from scratch. During a run, `video.ja.srt` is a crash checkpoint and is removed when `video.zh.srt` is finished (unless `--keep-src-srt`).
 
 ## SenseVoice
 
