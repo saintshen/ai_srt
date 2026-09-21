@@ -65,7 +65,7 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
-ASR is written to `video.<src>.srt` as soon as recognition finishes (e.g. `video.ja.srt`). Translation then writes `video.<tgt>.srt`. If Ollama times out, rerun the same command: existing `.ja.srt` is reused and a partial `.zh.srt` resumes from the next cue. Completed outputs are skipped unless you pass `--force`.
+ASR is checkpointed to `video.<src>.srt` (e.g. `video.ja.srt`) so a crash can resume without re-recognizing. After `video.<tgt>.srt` is complete, that checkpoint is deleted — you only keep the bilingual `video.zh.srt`. Pass `--keep-src-srt` to leave the Japanese file in place. If Ollama times out, rerun the same command: an existing `.ja.srt` is reused and a partial `.zh.srt` resumes from the next cue. Completed `.zh.srt` files are skipped unless you pass `--force`.
 
 Any ffmpeg-readable video or audio works. In translate mode the output is `video.<tgt>.srt`.
 

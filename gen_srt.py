@@ -714,6 +714,9 @@ def main():
                          "trans=translate-shell/Google (faster, sends text online)")
     ap.add_argument("--force", action="store_true",
                     help="redo ASR and translation even if sidecar .srt files exist")
+    ap.add_argument("--keep-src-srt", action="store_true",
+                    help="when translating, also keep video.<src>.srt; default is to "
+                         "delete that checkpoint after video.<tgt>.srt is complete")
     ap.add_argument("--list-langs", action="store_true",
                     help="list Whisper language codes and exit")
     ap.add_argument("--list-models", action="store_true",
@@ -815,6 +818,9 @@ def main():
         existing = load_srt_blocks(out_srt)
         if len(existing) >= len(segments):
             print(f"skip: {out_srt} already has {len(existing)} cues")
+            if not args.keep_src_srt and src_srt != out_srt and src_srt.is_file():
+                src_srt.unlink()
+                print(f"    removed checkpoint {src_srt}")
             print(f"done. subtitles saved to: {out_srt}")
             return
         if existing:
@@ -848,6 +854,9 @@ def main():
             print(f"  [{idx}] {start:.1f}-{end:.1f}: (translated)")
             idx += 1
 
+    if not args.keep_src_srt and src_srt != out_srt and src_srt.is_file():
+        src_srt.unlink()
+        print(f"    removed checkpoint {src_srt}")
     print(f"done. subtitles saved to: {out_srt}")
 
 

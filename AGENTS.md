@@ -123,7 +123,8 @@ There is no test suite for the top-level script. `whisper.cpp/tests/`
   `build/` or `gguf/`.
 - Always persist `{stem}.{src}.srt` after ASR before translating, flush each
   translated cue, retry Ollama timeouts, and skip/resume existing sidecar
-  SRTs. `--force` is the only way to redo them. See GitHub issue #1.
+  SRTs. After a complete `{stem}.{tgt}.srt`, delete the src checkpoint unless
+  `--keep-src-srt`. `--force` is the only way to redo them. See GitHub issue #1.
 - FunASR's official prebuilt Vulkan zip was reported crashing on RX 9070 XT
   **Windows**. A local Linux RADV build can still work; do not skip compiling
   because of that Windows note. `--sv-backend auto` still falls back to CPU
