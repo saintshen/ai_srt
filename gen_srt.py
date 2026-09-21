@@ -686,12 +686,13 @@ class Tee:
         return False
 
 
-def list_media_files(directory: Path):
+def list_media_files(directory: Path, recursive: bool = True):
     files = []
-    for path in sorted(directory.iterdir()):
+    iterator = directory.rglob("*") if recursive else directory.iterdir()
+    for path in iterator:
         if path.is_file() and path.suffix.lower() in VIDEO_EXTS:
             files.append(path)
-    return files
+    return sorted(files)
 
 
 def process_one(media_path: Path, args):
@@ -828,7 +829,8 @@ def main():
                     "(local Whisper or SenseVoice, optional translation)",
     )
     ap.add_argument("media", type=Path, nargs="?",
-                    help="video/audio file, or a directory of videos (*.mp4, *.mkv, …)")
+                    help="video/audio file, or a directory of videos (*.mp4, *.mkv, …); "
+                         "directories are scanned recursively")
     ap.add_argument("--from", dest="src_lang", default="auto", metavar="LANG",
                     type=lambda s: normalize_lang(s, allow_auto=True),
                     help="source language code, default auto (Whisper detect). Common: ja/en/zh/ko")
@@ -877,6 +879,9 @@ def main():
     ap.add_argument("--log", default=None, metavar="PATH",
                     help="append stdout/stderr and the command line to this file "
                          "(default: <dir>/gen_srt.log next to the media)")
+    ap.add_argument("--no-recursive", action="store_true",
+                    help="when media is a directory, only process videos in that "
+                         "folder, not subdirectories")
     ap.add_argument("--list-langs", action="store_true",
                     help="list Whisper language codes and exit")
     ap.add_argument("--list-models", action="store_true",
@@ -916,7 +921,7 @@ def main():
 
     try:
         if media_path.is_dir():
-            files = list_media_files(media_path)
+            files = list_media_files(media_path, recursive=not args.no_recursive)
             if not files:
                 sys.exit(f"no video files in {media_path}")
             print(f"found {len(files)} video(s) in {media_path}")

@@ -66,7 +66,7 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
-Pass a **directory** to process every `*.mp4` / `*.mkv` / … in it (sorted by name). One file failing does not skip the rest. Command line, timestamps, and all output are appended to `gen_srt.log` in that directory (override with `--log`).
+Pass a **directory** to process every `*.mp4` / `*.mkv` / … in it and in subdirectories (sorted by path). Use `--no-recursive` for that folder only. One file failing does not skip the rest. Command line, timestamps, and all output are appended to `gen_srt.log` in that directory (override with `--log`).
 
 ASR is checkpointed to `video.<src>.srt` (e.g. `video.ja.srt`) so a crash can resume without re-recognizing. After `video.<tgt>.srt` is complete, that checkpoint is deleted — you only keep the bilingual `video.zh.srt`. Pass `--keep-src-srt` to leave the Japanese file in place. If Ollama times out, rerun the same command: an existing `.ja.srt` is reused and a partial `.zh.srt` resumes from the next cue. Completed `.zh.srt` files are skipped unless you pass `--force`. Leftover `.ja.srt` from older runs is removed on that skip.
 
