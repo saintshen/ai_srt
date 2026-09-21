@@ -23,6 +23,7 @@ Usage:
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh
     python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --no-bilingual
     python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
+    python3 gen_srt.py /path/to/dir --from ja --to zh --asr sensevoice
     python3 gen_srt.py /path/to/video.mp4 --model small
     python3 gen_srt.py /path/to/video.mp4 --to zh --ollama-model gemma4
     python3 gen_srt.py /path/to/video.mp4 --engine trans --to zh
@@ -42,8 +43,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -71,6 +74,7 @@ DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3.5"
 DEFAULT_VAD_MAX_SPEECH_S = 8.0
 OLLAMA_RETRIES = 3
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 SENSEVOICE_LANGS = {"zh", "en", "ja", "ko", "yue"}
 
 # whisper.cpp language codes → English names (aligned with src/whisper.cpp g_lang)
@@ -665,75 +669,33 @@ def list_langs():
         print(f"{code:<6} {name:<20}")
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Generate subtitles from video or audio "
-                    "(local Whisper or SenseVoice, optional translation)",
-    )
-    ap.add_argument("media", type=Path, nargs="?",
-                    help="video or audio file (anything ffmpeg can read)")
-    ap.add_argument("--from", dest="src_lang", default="auto", metavar="LANG",
-                    type=lambda s: normalize_lang(s, allow_auto=True),
-                    help="source language code, default auto (Whisper detect). Common: ja/en/zh/ko")
-    ap.add_argument("--to", dest="tgt_lang", default=None, metavar="LANG",
-                    type=lambda s: normalize_lang(s, allow_auto=False),
-                    help="target language. Omit to transcribe only. Common: zh/en/ja")
-    ap.add_argument("--asr", choices=["whisper", "sensevoice"], default="whisper",
-                    help="speech recognition: whisper=whisper.cpp Vulkan (default), "
-                         "sensevoice=SenseVoice Small via FunASR llama.cpp/ggml "
-                         "(Japanese / zh/en/ja/ko/yue)")
-    ap.add_argument("--sv-backend", choices=["auto", "cpu", "vulkan"], default="auto",
-                    help="SenseVoice compute backend. auto tries Vulkan then CPU")
-    ap.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
-                    help="Whisper ASR model: tiny/base/small/medium/large-v3/"
-                         "large-v3-turbo (default large-v3-turbo; ignored with "
-                         "--asr sensevoice). Not the translator; see --ollama-model")
-    ap.add_argument("--ollama-model", default=None, metavar="NAME",
-                    help="Ollama translation model, default qwen3.5. "
-                         "See --list-models for locally installed models")
-    ap.add_argument("--keep-alive", default="10m",
-                    help="how long to keep the Ollama model in VRAM, to avoid reload")
-    ap.add_argument("--bilingual", dest="bilingual", action="store_true", default=True,
-                    help="bilingual SRT: translation plus original (on by default when translating)")
-    ap.add_argument("--no-bilingual", dest="bilingual", action="store_false",
-                    help="translation only, no original line")
-    ap.add_argument("--no-vad", action="store_true",
-                    help="disable VAD and process the full audio (do not skip silence)")
-    ap.add_argument("--vad-threshold", type=float, default=0.5,
-                    help="VAD speech threshold, default 0.5, range 0-1. "
-                         "Lower (e.g. 0.3) catches more weak speech, with more false positives")
-    ap.add_argument("--vad-min-silence", type=int, default=100,
-                    help="VAD minimum silence in ms, default 100, used to split segments")
-    ap.add_argument("--vad-max-speech", type=float, default=DEFAULT_VAD_MAX_SPEECH_S,
-                    help="VAD max speech span in seconds, default 8, splits long "
-                         "talk into shorter subtitle cues")
-    ap.add_argument("--no-suppress-music", action="store_true",
-                    help="keep non-speech placeholders such as (音楽)/(拍手)/(music)")
-    ap.add_argument("--engine", choices=["ollama", "trans"], default="ollama",
-                    help="translation engine: ollama=local offline (default), "
-                         "trans=translate-shell/Google (faster, sends text online)")
-    ap.add_argument("--force", action="store_true",
-                    help="redo ASR and translation even if sidecar .srt files exist")
-    ap.add_argument("--keep-src-srt", action="store_true",
-                    help="when translating, also keep video.<src>.srt; default is to "
-                         "delete that checkpoint after video.<tgt>.srt is complete")
-    ap.add_argument("--list-langs", action="store_true",
-                    help="list Whisper language codes and exit")
-    ap.add_argument("--list-models", action="store_true",
-                    help="list local Ollama translation models and exit")
-    args = ap.parse_args()
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
 
-    if args.list_langs:
-        list_langs()
-        return
-    if args.list_models:
-        print_ollama_models()
-        return
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
 
-    if args.media is None:
-        ap.error("please provide a video or audio file")
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
-    media_path = args.media.resolve()
+    def isatty(self):
+        return False
+
+
+def list_media_files(directory: Path):
+    files = []
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTS:
+            files.append(path)
+    return files
+
+
+def process_one(media_path: Path, args):
+    media_path = media_path.resolve()
     if not media_path.exists():
         sys.exit(f"file not found: {media_path}")
 
@@ -858,6 +820,138 @@ def main():
         src_srt.unlink()
         print(f"    removed checkpoint {src_srt}")
     print(f"done. subtitles saved to: {out_srt}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Generate subtitles from video or audio "
+                    "(local Whisper or SenseVoice, optional translation)",
+    )
+    ap.add_argument("media", type=Path, nargs="?",
+                    help="video/audio file, or a directory of videos (*.mp4, *.mkv, …)")
+    ap.add_argument("--from", dest="src_lang", default="auto", metavar="LANG",
+                    type=lambda s: normalize_lang(s, allow_auto=True),
+                    help="source language code, default auto (Whisper detect). Common: ja/en/zh/ko")
+    ap.add_argument("--to", dest="tgt_lang", default=None, metavar="LANG",
+                    type=lambda s: normalize_lang(s, allow_auto=False),
+                    help="target language. Omit to transcribe only. Common: zh/en/ja")
+    ap.add_argument("--asr", choices=["whisper", "sensevoice"], default="whisper",
+                    help="speech recognition: whisper=whisper.cpp Vulkan (default), "
+                         "sensevoice=SenseVoice Small via FunASR llama.cpp/ggml "
+                         "(Japanese / zh/en/ja/ko/yue)")
+    ap.add_argument("--sv-backend", choices=["auto", "cpu", "vulkan"], default="auto",
+                    help="SenseVoice compute backend. auto tries Vulkan then CPU")
+    ap.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
+                    help="Whisper ASR model: tiny/base/small/medium/large-v3/"
+                         "large-v3-turbo (default large-v3-turbo; ignored with "
+                         "--asr sensevoice). Not the translator; see --ollama-model")
+    ap.add_argument("--ollama-model", default=None, metavar="NAME",
+                    help="Ollama translation model, default qwen3.5. "
+                         "See --list-models for locally installed models")
+    ap.add_argument("--keep-alive", default="10m",
+                    help="how long to keep the Ollama model in VRAM, to avoid reload")
+    ap.add_argument("--bilingual", dest="bilingual", action="store_true", default=True,
+                    help="bilingual SRT: translation plus original (on by default when translating)")
+    ap.add_argument("--no-bilingual", dest="bilingual", action="store_false",
+                    help="translation only, no original line")
+    ap.add_argument("--no-vad", action="store_true",
+                    help="disable VAD and process the full audio (do not skip silence)")
+    ap.add_argument("--vad-threshold", type=float, default=0.5,
+                    help="VAD speech threshold, default 0.5, range 0-1. "
+                         "Lower (e.g. 0.3) catches more weak speech, with more false positives")
+    ap.add_argument("--vad-min-silence", type=int, default=100,
+                    help="VAD minimum silence in ms, default 100, used to split segments")
+    ap.add_argument("--vad-max-speech", type=float, default=DEFAULT_VAD_MAX_SPEECH_S,
+                    help="VAD max speech span in seconds, default 8, splits long "
+                         "talk into shorter subtitle cues")
+    ap.add_argument("--no-suppress-music", action="store_true",
+                    help="keep non-speech placeholders such as (音楽)/(拍手)/(music)")
+    ap.add_argument("--engine", choices=["ollama", "trans"], default="ollama",
+                    help="translation engine: ollama=local offline (default), "
+                         "trans=translate-shell/Google (faster, sends text online)")
+    ap.add_argument("--force", action="store_true",
+                    help="redo ASR and translation even if sidecar .srt files exist")
+    ap.add_argument("--keep-src-srt", action="store_true",
+                    help="when translating, also keep video.<src>.srt; default is to "
+                         "delete that checkpoint after video.<tgt>.srt is complete")
+    ap.add_argument("--log", default=None, metavar="PATH",
+                    help="append stdout/stderr and the command line to this file "
+                         "(default: <dir>/gen_srt.log next to the media)")
+    ap.add_argument("--list-langs", action="store_true",
+                    help="list Whisper language codes and exit")
+    ap.add_argument("--list-models", action="store_true",
+                    help="list local Ollama translation models and exit")
+    args = ap.parse_args()
+
+    if args.list_langs:
+        list_langs()
+        return
+    if args.list_models:
+        print_ollama_models()
+        return
+
+    if args.media is None:
+        ap.error("please provide a video, audio file, or directory")
+
+    media_path = args.media.expanduser()
+    if not media_path.exists():
+        sys.exit(f"file not found: {media_path.resolve()}")
+    media_path = media_path.resolve()
+
+    if args.log:
+        log_path = Path(args.log).expanduser().resolve()
+    elif media_path.is_dir():
+        log_path = media_path / "gen_srt.log"
+    else:
+        log_path = media_path.parent / "gen_srt.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8")
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = Tee(orig_out, log_file)
+    sys.stderr = Tee(orig_err, log_file)
+    print(f"--- {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} ---")
+    print(f"command: {sys.executable} {' '.join(sys.argv)}")
+    print(f"cwd: {Path.cwd()}")
+    print(f"log: {log_path}")
+
+    try:
+        if media_path.is_dir():
+            files = list_media_files(media_path)
+            if not files:
+                sys.exit(f"no video files in {media_path}")
+            print(f"found {len(files)} video(s) in {media_path}")
+            failed = []
+            for i, path in enumerate(files, 1):
+                print(f"\n==== [{i}/{len(files)}] {path.name} ====")
+                try:
+                    process_one(path, args)
+                except KeyboardInterrupt:
+                    print("interrupted")
+                    raise
+                except SystemExit as e:
+                    msg = e.code if isinstance(e.code, str) else (e.code or "")
+                    print(f"FAIL {path}: {msg}")
+                    failed.append(path)
+                except Exception:
+                    traceback.print_exc()
+                    print(f"FAIL {path}")
+                    failed.append(path)
+            print(f"\n==== summary: {len(files) - len(failed)} ok, {len(failed)} failed ====")
+            for path in failed:
+                print(f"  FAIL {path}")
+            if failed:
+                sys.exit(1)
+            return
+        process_one(media_path, args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code)
+        raise
+    finally:
+        sys.stdout = orig_out
+        sys.stderr = orig_err
+        log_file.close()
+        print(f"log saved to {log_path}", file=orig_err)
 
 
 if __name__ == "__main__":

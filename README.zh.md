@@ -47,6 +47,7 @@ python3 gen_srt.py /path/to/video.mp4 --from ja
 # 日语 / 中 / 英 / 韩 / 粤 用 SenseVoice（本地编译的 FunASR llama.cpp + Vulkan）
 python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice
 python3 gen_srt.py /path/to/video.mp4 --from ja --to zh --asr sensevoice
+python3 gen_srt.py /path/to/dir --from ja --to zh --asr sensevoice
 python3 gen_srt.py /path/to/video.mp4 --from ja --asr sensevoice --sv-backend cpu
 
 # 翻译成中文（默认双语：译文 + 原文）
@@ -65,7 +66,9 @@ python3 gen_srt.py --list-models
 python3 gen_srt.py --help
 ```
 
-识别过程中会先写检查点 `video.<源语言>.srt`（例如 `video.ja.srt`），避免崩溃后重跑 ASR。等双语 `video.zh.srt` 全部写完后会删掉这个检查点，目录里只留一份中日字幕。若要同时保留日文字幕，加 `--keep-src-srt`。Ollama 超时后用同一条命令重跑即可：已有的 `.ja.srt` 会复用，不完整的 `.zh.srt` 从下一条继续。已经完成的 `.zh.srt` 会跳过，除非加 `--force`。
+可以直接把**目录**传给脚本，按文件名处理其中所有 `*.mp4` / `*.mkv` 等。某个文件失败不会跳过后面的。命令行、时间和全部输出会追加到该目录的 `gen_srt.log`（可用 `--log` 改路径）。
+
+识别过程中会先写检查点 `video.<源语言>.srt`（例如 `video.ja.srt`），避免崩溃后重跑 ASR。等双语 `video.zh.srt` 全部写完后会删掉这个检查点，目录里只留一份中日字幕。若要同时保留日文字幕，加 `--keep-src-srt`。Ollama 超时后用同一条命令重跑即可：已有的 `.ja.srt` 会复用，不完整的 `.zh.srt` 从下一条继续。已经完成的 `.zh.srt` 会跳过，除非加 `--force`。旧版本留下的 `.ja.srt` 在这次 skip 时也会删掉。
 
 任意 ffmpeg 能读的视频或音频都可以。翻译模式下输出是 `video.<目标语言>.srt`。
 
